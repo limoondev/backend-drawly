@@ -85,7 +85,7 @@ const CONFIG = {
   port: Number.parseInt(process.env.PORT) || 3001,
   host: process.env.HOST || (env.behindProxy ? "127.0.0.1" : "0.0.0.0"),
 
-  publicUrl: process.env.PUBLIC_URL || "https://limoon-space.cloud/drawly/api",
+  publicUrl: process.env.PUBLIC_URL || "https://limoonfn.cloud/drawly/api",
   basePath: process.env.BASE_PATH || "/drawly/api",
 
   ssl: {
@@ -356,7 +356,7 @@ const stmt = {
   getProfile: db.prepare("SELECT * FROM user_profiles WHERE user_id = ?"),
   updateProfile: db.prepare("UPDATE user_profiles SET bio = ?, country = ? WHERE user_id = ?"),
   updateProfileStats: db.prepare(`
-    UPDATE user_profiles SET 
+    UPDATE user_profiles SET
     games_played = games_played + ?,
     games_won = games_won + ?,
     total_score = total_score + ?,
@@ -2153,7 +2153,7 @@ function startServer() {
 
     // Auto-configuration info
     console.log(`${C.cyan}[i] Configuration auto-detectee pour VPS${C.reset}`)
-    console.log(`${C.dim}    Nginx/Caddy doit proxyfier vers ${localUrl}${C.reset}`)
+    console.log(`${C.dim}    Le nginx/caddy doit proxyfier vers ${localUrl}${C.reset}`)
     console.log(`${C.dim}    Le frontend doit utiliser: ${CONFIG.publicUrl}${C.reset}`)
     console.log(``)
   })
