@@ -358,7 +358,7 @@ function prepareStatements() {
       WHERE user_id = ?
     `),
     updateStats: db.prepare(`
-      UPDATE profiles SET 
+      UPDATE profiles SET
         games_played = games_played + 1,
         games_won = games_won + ?,
         total_score = total_score + ?,
@@ -377,8 +377,8 @@ function prepareStatements() {
     updateRoomSettings: db.prepare("UPDATE rooms SET draw_time = ?, max_rounds = ? WHERE id = ?"),
     deleteRoom: db.prepare("DELETE FROM rooms WHERE id = ?"),
     getPublicRooms: db.prepare(`
-      SELECT r.*, COUNT(p.id) as player_count 
-      FROM rooms r 
+      SELECT r.*, COUNT(p.id) as player_count
+      FROM rooms r
       LEFT JOIN players p ON r.id = p.room_id
       WHERE r.is_private = 0
       GROUP BY r.id
@@ -403,7 +403,7 @@ function prepareStatements() {
 
     // Bans
     getBanByIp: db.prepare(`
-      SELECT * FROM bans WHERE ip_address = ? 
+      SELECT * FROM bans WHERE ip_address = ?
       AND (expires_at IS NULL OR expires_at > datetime('now'))
     `),
     getBanByUser: db.prepare(`
@@ -1283,7 +1283,7 @@ function setupRoutes() {
   // Status endpoints (multiple paths for compatibility)
   const statusHandler = (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
-    return {
+    res.json({
       name: CONFIG.server.name,
       version: CONFIG.server.version,
       status: "online",
@@ -1298,7 +1298,7 @@ function setupRoutes() {
         activeRooms: rooms.size,
         uptime,
       },
-    }
+    })
   }
 
   app.get("/", statusHandler)
