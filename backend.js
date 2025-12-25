@@ -2037,7 +2037,7 @@ function startServer() {
     origin: "*", // Allow all origins for Coolify
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Upgrade", "Connection"],
   }
 
   app.use(cors(corsOptions))
@@ -2054,31 +2054,45 @@ function startServer() {
   server = createHttpServer(app)
   log("info", "HTTP server created (SSL handled by Coolify/Traefik)")
 
+  // Coolify/Traefik strips the base path, so we use /socket.io directly
+  // The frontend connects to https://domain/drawly/api which proxies to this server
+  // Socket.IO then uses /socket.io relative to this server
+  const SOCKET_PATH = process.env.SOCKET_PATH || "/socket.io"
+
   io = new Server(server, {
     cors: {
       origin: "*",
       methods: ["GET", "POST"],
       credentials: true,
     },
-    path: "/socket.io",
+    path: SOCKET_PATH,
     transports: ["polling", "websocket"],
     allowUpgrades: true,
+    upgradeTimeout: 30000,
     pingTimeout: 60000,
     pingInterval: 25000,
-    upgradeTimeout: 30000,
     maxHttpBufferSize: CONFIG.security.maxMessageSize,
-    allowEIO3: false,
+    allowEIO3: true,
+    addTrailingSlash: false,
     connectionStateRecovery: {
       maxDisconnectionDuration: 2 * 60 * 1000,
       skipMiddlewares: true,
     },
     cookie: false,
+    perMessageDeflate: false, // Disable compression for lower latency
+    httpCompression: false,
   })
 
   io.engine.on("connection_error", (err) => {
-    log("error", `Socket.IO engine error: ${err.message}`, {
+    log("warn", `Socket.IO connection error: ${err.message}`, {
       code: err.code,
-      context: err.context,
+      req: err.req?.url,
+    })
+  })
+
+  io.engine.on("connection", (rawSocket) => {
+    rawSocket.on("upgrade", () => {
+      log("debug", `Socket upgraded to WebSocket: ${rawSocket.id}`)
     })
   })
 
@@ -2091,13 +2105,15 @@ function startServer() {
       `${C.dim}Listen:${C.reset}         ${CONFIG.host}:${CONFIG.port}`,
       `${C.dim}Public URL:${C.reset}     ${CONFIG.publicUrl}`,
       `${C.dim}Platform:${C.reset}       ${env.platform}`,
-      `${C.dim}Socket Path:${C.reset}    /socket.io`,
+      `${C.dim}Socket Path:${C.reset}    ${SOCKET_PATH}`,
       `${C.dim}Coolify:${C.reset}        ${env.isCoolify ? "Yes" : "No"}`,
+      `${C.dim}Transports:${C.reset}     polling -> websocket`,
       `${C.dim}Origins:${C.reset}        * (all allowed)`,
     ])
 
     log("success", `Server is running on port ${CONFIG.port}`)
-    log("info", `Socket.IO available at /socket.io`)
+    log("info", `Socket.IO path: ${SOCKET_PATH}`)
+    log("info", `Full URL: ${CONFIG.publicUrl}${SOCKET_PATH}`)
   })
 }
 
