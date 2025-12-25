@@ -1258,13 +1258,56 @@ function shuffleArray(array) {
 let app, server, io
 
 function setupRoutes() {
-  // Health check
+  app.use((req, res, next) => {
+    res.header("Access-Control-Allow-Origin", "*")
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Admin-Key",
+    )
+    res.header("Access-Control-Allow-Credentials", "true")
+
+    if (req.method === "OPTIONS") {
+      return res.status(200).end()
+    }
+    next()
+  })
+
   app.get("/", (req, res) => {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     res.json({
       name: CONFIG.server.name,
       version: CONFIG.server.version,
       status: "online",
-      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+      players: socketToPlayer.size,
+      rooms: rooms.size,
+      uptime,
+      stats: {
+        connections: socketToPlayer.size,
+        players: socketToPlayer.size,
+        rooms: rooms.size,
+        activeRooms: rooms.size,
+        uptime,
+      },
+    })
+  })
+
+  app.get("/status", (req, res) => {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
+    res.json({
+      name: CONFIG.server.name,
+      version: CONFIG.server.version,
+      status: "online",
+      players: socketToPlayer.size,
+      rooms: rooms.size,
+      uptime,
+      stats: {
+        connections: socketToPlayer.size,
+        players: socketToPlayer.size,
+        rooms: rooms.size,
+        activeRooms: rooms.size,
+        uptime,
+      },
     })
   })
 
@@ -1275,27 +1318,62 @@ function setupRoutes() {
     })
   })
 
-  // Status endpoint
   app.get("/api/status", (req, res) => {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     res.json({
       name: CONFIG.server.name,
       version: CONFIG.server.version,
       status: "online",
       players: socketToPlayer.size,
       rooms: rooms.size,
-      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+      uptime,
+      stats: {
+        connections: socketToPlayer.size,
+        players: socketToPlayer.size,
+        rooms: rooms.size,
+        activeRooms: rooms.size,
+        uptime,
+      },
+    })
+  })
+
+  app.get("/api/info", (req, res) => {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
+    res.json({
+      name: CONFIG.server.name,
+      version: CONFIG.server.version,
+      status: "online",
+      players: socketToPlayer.size,
+      rooms: rooms.size,
+      uptime,
+      stats: {
+        connections: socketToPlayer.size,
+        players: socketToPlayer.size,
+        rooms: rooms.size,
+        activeRooms: rooms.size,
+        uptime,
+      },
+      features: ["rooms", "auth", "chat", "drawing", "word-selection"],
     })
   })
 
   // Stats endpoint
   app.get("/api/stats", (req, res) => {
     const memUsage = process.memoryUsage()
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     res.json({
       connections: socketToPlayer.size,
       rooms: rooms.size,
       players: Array.from(rooms.values()).reduce((sum, r) => sum + r.players.size, 0),
       games: stats.totalGamesPlayed,
-      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+      uptime,
+      stats: {
+        connections: socketToPlayer.size,
+        players: socketToPlayer.size,
+        rooms: rooms.size,
+        activeRooms: rooms.size,
+        uptime,
+      },
       memory: {
         used: Math.round(memUsage.heapUsed / 1024 / 1024),
         total: Math.round(memUsage.heapTotal / 1024 / 1024),
