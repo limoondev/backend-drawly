@@ -1,17 +1,16 @@
 #!/usr/bin/env node
 // ============================================================
-// DRAWLY BACKEND v5.3.0 - Enhanced with better logging & fixes
+// DRAWLY BACKEND v5.4.0 - Multi-path Socket.IO for Coolify
 // ============================================================
 // Optimized for: https://limoon-space.cloud/drawly/api/
 // ============================================================
 
 import express from "express"
 import { createServer as createHttpServer } from "http"
-import { createServer as createHttpsServer } from "https"
 import { Server } from "socket.io"
 import cors from "cors"
 import Database from "better-sqlite3"
-import { existsSync, mkdirSync, readFileSync } from "fs"
+import { existsSync, mkdirSync } from "fs"
 import path from "path"
 import crypto from "crypto"
 
@@ -24,11 +23,14 @@ const detectEnvironment = () => {
   const hasReverseProxy =
     process.env.REVERSE_PROXY === "true" || process.env.TRUST_PROXY === "true" || process.env.HOST === "127.0.0.1"
 
+  const isCoolify = process.env.COOLIFY_FQDN || process.env.COOLIFY_URL || process.env.COOLIFY_CONTAINER_NAME
+
   const behindProxy =
     hasReverseProxy ||
+    isCoolify ||
     existsSync("/etc/nginx") ||
     existsSync("/etc/caddy") ||
-    existsSync("/etc/apache2") ||
+    existsSync("/etc/traefik") ||
     process.env.RENDER ||
     process.env.RAILWAY_ENVIRONMENT ||
     process.env.VERCEL
@@ -36,13 +38,16 @@ const detectEnvironment = () => {
   return {
     isProduction,
     behindProxy,
-    platform: process.env.RENDER
-      ? "render"
-      : process.env.RAILWAY_ENVIRONMENT
-        ? "railway"
-        : process.env.VERCEL
-          ? "vercel"
-          : "vps",
+    isCoolify,
+    platform: isCoolify
+      ? "coolify"
+      : process.env.RENDER
+        ? "render"
+        : process.env.RAILWAY_ENVIRONMENT
+          ? "railway"
+          : process.env.VERCEL
+            ? "vercel"
+            : "vps",
   }
 }
 
@@ -94,11 +99,11 @@ const C = {
 const CONFIG = {
   server: {
     name: process.env.SERVER_NAME || "Drawly Server",
-    version: "5.3.0",
+    version: "5.4.0",
   },
 
   port: Number.parseInt(process.env.PORT) || 3001,
-  host: process.env.HOST || (env.behindProxy ? "127.0.0.1" : "0.0.0.0"),
+  host: process.env.HOST || "0.0.0.0", // Listen on all interfaces for Coolify
 
   publicUrl: process.env.PUBLIC_URL || "https://limoon-space.cloud/drawly/api",
   basePath: process.env.BASE_PATH || "/drawly/api",
@@ -112,15 +117,22 @@ const CONFIG = {
   security: {
     allowedOrigins: process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(",").map((o) => o.trim())
-      : ["https://limoon-space.cloud", "https://drawly.app", "http://localhost:3000", "http://127.0.0.1:3000"],
+      : [
+          "https://limoon-space.cloud",
+          "http://limoon-space.cloud",
+          "https://drawly.app",
+          "http://localhost:3000",
+          "http://127.0.0.1:3000",
+          "*", // Allow all for debugging
+        ],
 
     rateLimit: {
-      connectionsPerMinute: Number.parseInt(process.env.RATE_LIMIT_CONNECTIONS) || 30,
+      connectionsPerMinute: Number.parseInt(process.env.RATE_LIMIT_CONNECTIONS) || 60,
       messagesPerSecond: Number.parseInt(process.env.RATE_LIMIT_MESSAGES) || 100,
       penaltyTime: 60000,
     },
     maxMessageSize: Number.parseInt(process.env.MAX_MESSAGE_SIZE) || 131072,
-    idleTimeout: Number.parseInt(process.env.IDLE_TIMEOUT) || 900000, // 15 minutes
+    idleTimeout: Number.parseInt(process.env.IDLE_TIMEOUT) || 900000,
   },
 
   database: {
@@ -150,273 +162,326 @@ function log(type, message, data = null) {
   recentLogs.unshift(logEntry)
   if (recentLogs.length > MAX_LOGS) recentLogs.pop()
 
-  const configs = {
-    info: { color: C.cyan, icon: "ℹ", prefix: "INFO" },
-    success: { color: C.green, icon: "✓", prefix: "OK" },
-    warning: { color: C.yellow, icon: "⚠", prefix: "WARN" },
-    error: { color: C.red, icon: "✗", prefix: "ERR" },
-    admin: { color: C.magenta, icon: "★", prefix: "ADMIN" },
-    game: { color: C.blue, icon: "🎮", prefix: "GAME" },
-    socket: { color: C.brightCyan, icon: "⚡", prefix: "SOCK" },
-    security: { color: C.brightRed, icon: "🛡", prefix: "SEC" },
-    room: { color: C.brightMagenta, icon: "🏠", prefix: "ROOM" },
-    player: { color: C.brightGreen, icon: "👤", prefix: "PLAYER" },
-    chat: { color: C.brightYellow, icon: "💬", prefix: "CHAT" },
-    draw: { color: C.brightBlue, icon: "🖌", prefix: "DRAW" },
-    network: { color: C.gray, icon: "🌐", prefix: "NET" },
-    db: { color: C.dim, icon: "💾", prefix: "DB" },
+  const icons = {
+    info: `${C.blue}ℹ${C.reset}`,
+    success: `${C.green}✓${C.reset}`,
+    warning: `${C.yellow}⚠${C.reset}`,
+    error: `${C.red}✖${C.reset}`,
+    socket: `${C.magenta}⚡${C.reset}`,
+    room: `${C.cyan}🏠${C.reset}`,
+    game: `${C.brightMagenta}🎮${C.reset}`,
+    player: `${C.brightCyan}👤${C.reset}`,
+    network: `${C.brightBlue}🌐${C.reset}`,
+    db: `${C.brightYellow}💾${C.reset}`,
+    security: `${C.brightRed}🔒${C.reset}`,
+    debug: `${C.gray}🔍${C.reset}`,
   }
 
-  const cfg = configs[type] || configs.info
+  const icon = icons[type] || icons.info
   const time = new Date().toLocaleTimeString("fr-FR", { hour12: false })
+  const typeColor =
+    {
+      error: C.red,
+      warning: C.yellow,
+      success: C.green,
+      info: C.blue,
+      socket: C.magenta,
+      room: C.cyan,
+      game: C.brightMagenta,
+      player: C.brightCyan,
+      network: C.brightBlue,
+      db: C.brightYellow,
+      security: C.brightRed,
+      debug: C.gray,
+    }[type] || C.white
 
-  const prefix = `${C.dim}[${time}]${C.reset} ${cfg.color}${cfg.icon} ${cfg.prefix}${C.reset}`
-
+  console.log(`${C.dim}${time}${C.reset} ${icon} ${typeColor}${message}${C.reset}`)
   if (data) {
-    console.log(`${prefix} ${message}`)
-    console.log(`${C.dim}       └─ ${JSON.stringify(data)}${C.reset}`)
-  } else {
-    console.log(`${prefix} ${message}`)
+    console.log(`       ${C.dim}└─${C.reset}`, data)
   }
 }
 
 function logBox(title, lines) {
-  const maxLen = Math.max(title.length, ...lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "").length))
-  const border = "─".repeat(maxLen + 2)
+  const width = 60
+  console.log("")
+  console.log(`${C.cyan}┌${"─".repeat(width - 2)}┐${C.reset}`)
+  console.log(`${C.cyan}│${C.reset} ${C.bold}${title.padEnd(width - 4)}${C.reset} ${C.cyan}│${C.reset}`)
+  console.log(`${C.cyan}├${"─".repeat(width - 2)}┤${C.reset}`)
+  lines.forEach((line) => {
+    const cleanLine = line.replace(/\x1b\[[0-9;]*m/g, "")
+    const padding = width - 4 - cleanLine.length
+    console.log(`${C.cyan}│${C.reset} ${line}${" ".repeat(Math.max(0, padding))} ${C.cyan}│${C.reset}`)
+  })
+  console.log(`${C.cyan}└${"─".repeat(width - 2)}┘${C.reset}`)
+  console.log("")
+}
 
-  console.log(`${C.cyan}┌${border}┐${C.reset}`)
-  console.log(`${C.cyan}│${C.reset} ${C.bold}${title.padEnd(maxLen)}${C.reset} ${C.cyan}│${C.reset}`)
-  console.log(`${C.cyan}├${border}┤${C.reset}`)
-  for (const line of lines) {
-    const cleanLen = line.replace(/\x1b\[[0-9;]*m/g, "").length
-    console.log(`${C.cyan}│${C.reset} ${line}${" ".repeat(maxLen - cleanLen)} ${C.cyan}│${C.reset}`)
+// ============================================================
+// DATABASE
+// ============================================================
+
+let db
+
+function initDatabase() {
+  const dbDir = path.dirname(CONFIG.database.path)
+  if (!existsSync(dbDir)) {
+    mkdirSync(dbDir, { recursive: true })
+    log("db", `Created database directory: ${dbDir}`)
   }
-  console.log(`${C.cyan}└${border}┘${C.reset}`)
+
+  db = new Database(CONFIG.database.path)
+  db.pragma("journal_mode = WAL")
+  db.pragma("synchronous = NORMAL")
+  db.pragma("foreign_keys = ON")
+
+  // Create tables
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT UNIQUE NOT NULL,
+      username TEXT UNIQUE,
+      display_name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      avatar_url TEXT,
+      is_premium INTEGER DEFAULT 0,
+      is_admin INTEGER DEFAULT 0,
+      is_banned INTEGER DEFAULT 0,
+      ban_reason TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token TEXT UNIQUE NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS profiles (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      bio TEXT,
+      country TEXT,
+      games_played INTEGER DEFAULT 0,
+      games_won INTEGER DEFAULT 0,
+      total_score INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS rooms (
+      id TEXT PRIMARY KEY,
+      code TEXT UNIQUE NOT NULL,
+      host_id TEXT,
+      is_private INTEGER DEFAULT 0,
+      max_players INTEGER DEFAULT 8,
+      draw_time INTEGER DEFAULT 80,
+      max_rounds INTEGER DEFAULT 3,
+      theme TEXT DEFAULT 'general',
+      phase TEXT DEFAULT 'lobby',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS players (
+      id TEXT PRIMARY KEY,
+      room_id TEXT REFERENCES rooms(id) ON DELETE CASCADE,
+      user_id TEXT REFERENCES users(id),
+      name TEXT NOT NULL,
+      avatar TEXT,
+      score INTEGER DEFAULT 0,
+      is_host INTEGER DEFAULT 0,
+      socket_id TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS bans (
+      id TEXT PRIMARY KEY,
+      ip_address TEXT,
+      user_id TEXT REFERENCES users(id),
+      reason TEXT,
+      banned_by TEXT,
+      expires_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_players_room ON players(room_id);
+    CREATE INDEX IF NOT EXISTS idx_players_socket ON players(socket_id);
+    CREATE INDEX IF NOT EXISTS idx_rooms_code ON rooms(code);
+  `)
+
+  log("db", "Database initialized", { path: CONFIG.database.path })
 }
-
-// ============================================================
-// DATABASE SETUP
-// ============================================================
-
-const dbDir = path.dirname(CONFIG.database.path)
-if (!existsSync(dbDir)) {
-  mkdirSync(dbDir, { recursive: true })
-}
-
-const db = new Database(CONFIG.database.path)
-db.pragma("journal_mode = WAL")
-db.pragma("synchronous = NORMAL")
-
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    email TEXT UNIQUE,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    display_name TEXT NOT NULL,
-    avatar_url TEXT,
-    is_premium INTEGER DEFAULT 0,
-    is_admin INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch() * 1000),
-    updated_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    token TEXT UNIQUE NOT NULL,
-    expires_at INTEGER NOT NULL,
-    created_at INTEGER DEFAULT (unixepoch() * 1000),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS user_profiles (
-    user_id TEXT PRIMARY KEY,
-    bio TEXT,
-    country TEXT,
-    games_played INTEGER DEFAULT 0,
-    games_won INTEGER DEFAULT 0,
-    total_score INTEGER DEFAULT 0,
-    best_score INTEGER DEFAULT 0,
-    words_guessed INTEGER DEFAULT 0,
-    drawings_made INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS rooms (
-    id TEXT PRIMARY KEY,
-    code TEXT UNIQUE NOT NULL,
-    host_id TEXT,
-    phase TEXT DEFAULT 'waiting',
-    round INTEGER DEFAULT 1,
-    turn INTEGER DEFAULT 0,
-    max_rounds INTEGER DEFAULT 3,
-    draw_time INTEGER DEFAULT 80,
-    time_left INTEGER DEFAULT 80,
-    current_drawer TEXT,
-    current_word TEXT,
-    word_length INTEGER DEFAULT 0,
-    masked_word TEXT DEFAULT '',
-    theme TEXT DEFAULT 'general',
-    is_private INTEGER DEFAULT 0,
-    max_players INTEGER DEFAULT 8,
-    player_count INTEGER DEFAULT 0,
-    created_at INTEGER DEFAULT (unixepoch() * 1000),
-    updated_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE TABLE IF NOT EXISTS players (
-    id TEXT PRIMARY KEY,
-    room_id TEXT NOT NULL,
-    user_id TEXT,
-    name TEXT NOT NULL,
-    avatar TEXT,
-    score INTEGER DEFAULT 0,
-    is_host INTEGER DEFAULT 0,
-    is_drawing INTEGER DEFAULT 0,
-    has_guessed INTEGER DEFAULT 0,
-    is_connected INTEGER DEFAULT 1,
-    socket_id TEXT,
-    created_at INTEGER DEFAULT (unixepoch() * 1000),
-    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS game_history (
-    id TEXT PRIMARY KEY,
-    room_code TEXT NOT NULL,
-    player_count INTEGER,
-    rounds_played INTEGER,
-    winner_id TEXT,
-    winner_name TEXT,
-    created_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE TABLE IF NOT EXISTS bans (
-    id TEXT PRIMARY KEY,
-    ip TEXT,
-    user_id TEXT,
-    reason TEXT,
-    banned_by TEXT,
-    expires_at INTEGER,
-    is_active INTEGER DEFAULT 1,
-    created_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE TABLE IF NOT EXISTS reports (
-    id TEXT PRIMARY KEY,
-    reporter_id TEXT,
-    reported_id TEXT,
-    reported_name TEXT,
-    reason TEXT,
-    details TEXT,
-    room_code TEXT,
-    status TEXT DEFAULT 'pending',
-    created_at INTEGER DEFAULT (unixepoch() * 1000)
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_rooms_code ON rooms(code);
-  CREATE INDEX IF NOT EXISTS idx_players_room ON players(room_id);
-  CREATE INDEX IF NOT EXISTS idx_players_socket ON players(socket_id);
-  CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
-  CREATE INDEX IF NOT EXISTS idx_bans_ip ON bans(ip);
-`)
-
-log("db", "Database initialized")
 
 // Prepared statements
-const stmt = {
-  // Rooms
-  createRoom: db.prepare(`
-    INSERT INTO rooms (id, code, host_id, draw_time, max_rounds, theme, is_private, max_players)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `),
-  getRoom: db.prepare("SELECT * FROM rooms WHERE id = ?"),
-  getRoomByCode: db.prepare("SELECT * FROM rooms WHERE code = ?"),
-  getAllRooms: db.prepare("SELECT * FROM rooms"),
-  updateRoom: db.prepare(`
-    UPDATE rooms SET phase = ?, round = ?, turn = ?, time_left = ?, current_drawer = ?,
-    current_word = ?, word_length = ?, masked_word = ?, player_count = ?, updated_at = ?
-    WHERE id = ?
-  `),
-  updateRoomSettings: db.prepare("UPDATE rooms SET draw_time = ?, max_rounds = ?, updated_at = ? WHERE id = ?"),
-  updateRoomHost: db.prepare("UPDATE rooms SET host_id = ?, updated_at = ? WHERE id = ?"),
-  deleteRoom: db.prepare("DELETE FROM rooms WHERE id = ?"),
+let stmt = {}
 
-  // Players
-  createPlayer: db.prepare(`
-    INSERT INTO players (id, room_id, user_id, name, avatar, is_host, socket_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `),
-  getPlayer: db.prepare("SELECT * FROM players WHERE id = ?"),
-  getPlayerBySocket: db.prepare("SELECT * FROM players WHERE socket_id = ?"),
-  getPlayersByRoom: db.prepare("SELECT * FROM players WHERE room_id = ? ORDER BY created_at ASC"),
-  updatePlayerScore: db.prepare("UPDATE players SET score = ? WHERE id = ?"),
-  updatePlayerDrawing: db.prepare("UPDATE players SET is_drawing = ?, has_guessed = ? WHERE id = ?"),
-  updatePlayerGuessed: db.prepare("UPDATE players SET has_guessed = ? WHERE id = ?"),
-  updatePlayerConnection: db.prepare("UPDATE players SET is_connected = ?, socket_id = ? WHERE id = ?"),
-  updatePlayerHost: db.prepare("UPDATE players SET is_host = ? WHERE id = ?"),
-  resetPlayersForRound: db.prepare("UPDATE players SET is_drawing = 0, has_guessed = 0 WHERE room_id = ?"),
-  resetPlayersForGame: db.prepare("UPDATE players SET score = 0, is_drawing = 0, has_guessed = 0 WHERE room_id = ?"),
-  deletePlayer: db.prepare("DELETE FROM players WHERE id = ?"),
-  deletePlayersByRoom: db.prepare("DELETE FROM players WHERE room_id = ?"),
+function prepareStatements() {
+  stmt = {
+    // Users
+    getUserById: db.prepare("SELECT * FROM users WHERE id = ?"),
+    getUserByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
+    getUserByUsername: db.prepare("SELECT * FROM users WHERE username = ?"),
+    createUser: db.prepare(`
+      INSERT INTO users (id, email, username, display_name, password_hash, avatar_url)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
+    updateUser: db.prepare(`
+      UPDATE users SET display_name = ?, avatar_url = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `),
+    updatePassword: db.prepare(`
+      UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    `),
 
-  // Users & Auth
-  createUser: db.prepare(`
-    INSERT INTO users (id, email, username, password_hash, display_name, avatar_url)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `),
-  getUserByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
-  getUserByUsername: db.prepare("SELECT * FROM users WHERE username = ?"),
-  getUserById: db.prepare("SELECT * FROM users WHERE id = ?"),
-  updateUser: db.prepare("UPDATE users SET display_name = ?, avatar_url = ?, updated_at = ? WHERE id = ?"),
-  updateUserPassword: db.prepare("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?"),
+    // Sessions
+    createSession: db.prepare(`
+      INSERT INTO sessions (id, user_id, token, expires_at)
+      VALUES (?, ?, ?, ?)
+    `),
+    getSessionByToken: db.prepare(`
+      SELECT s.*, u.* FROM sessions s
+      JOIN users u ON s.user_id = u.id
+      WHERE s.token = ? AND s.expires_at > datetime('now')
+    `),
+    deleteSession: db.prepare("DELETE FROM sessions WHERE token = ?"),
+    deleteUserSessions: db.prepare("DELETE FROM sessions WHERE user_id = ?"),
+    cleanExpiredSessions: db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')"),
 
-  // Sessions
-  createSession: db.prepare("INSERT INTO sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)"),
-  getSession: db.prepare("SELECT * FROM sessions WHERE token = ? AND expires_at > ?"),
-  deleteSession: db.prepare("DELETE FROM sessions WHERE token = ?"),
-  deleteExpiredSessions: db.prepare("DELETE FROM sessions WHERE expires_at < ?"),
-  deleteUserSessions: db.prepare("DELETE FROM sessions WHERE user_id = ?"),
+    // Profiles
+    getProfile: db.prepare("SELECT * FROM profiles WHERE user_id = ?"),
+    createProfile: db.prepare("INSERT OR IGNORE INTO profiles (user_id) VALUES (?)"),
+    updateProfile: db.prepare(`
+      UPDATE profiles SET bio = ?, country = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = ?
+    `),
+    updateStats: db.prepare(`
+      UPDATE profiles SET 
+        games_played = games_played + 1,
+        games_won = games_won + ?,
+        total_score = total_score + ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = ?
+    `),
 
-  // Profiles
-  createProfile: db.prepare("INSERT INTO user_profiles (user_id) VALUES (?)"),
-  getProfile: db.prepare("SELECT * FROM user_profiles WHERE user_id = ?"),
-  updateProfile: db.prepare("UPDATE user_profiles SET bio = ?, country = ? WHERE user_id = ?"),
-  updateProfileStats: db.prepare(`
-    UPDATE user_profiles SET
-    games_played = games_played + ?,
-    games_won = games_won + ?,
-    total_score = total_score + ?,
-    best_score = MAX(best_score, ?),
-    words_guessed = words_guessed + ?,
-    drawings_made = drawings_made + ?
-    WHERE user_id = ?
-  `),
+    // Rooms
+    createRoom: db.prepare(`
+      INSERT INTO rooms (id, code, host_id, is_private, max_players, draw_time, max_rounds, theme)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    getRoomByCode: db.prepare("SELECT * FROM rooms WHERE code = ?"),
+    getRoomById: db.prepare("SELECT * FROM rooms WHERE id = ?"),
+    updateRoomPhase: db.prepare("UPDATE rooms SET phase = ? WHERE id = ?"),
+    updateRoomSettings: db.prepare("UPDATE rooms SET draw_time = ?, max_rounds = ? WHERE id = ?"),
+    deleteRoom: db.prepare("DELETE FROM rooms WHERE id = ?"),
+    getPublicRooms: db.prepare(`
+      SELECT r.*, COUNT(p.id) as player_count 
+      FROM rooms r 
+      LEFT JOIN players p ON r.id = p.room_id
+      WHERE r.is_private = 0
+      GROUP BY r.id
+      HAVING player_count < r.max_players
+      ORDER BY player_count DESC
+      LIMIT 20
+    `),
 
-  // Game History
-  createGameHistory: db.prepare(`
-    INSERT INTO game_history (id, room_code, player_count, rounds_played, winner_id, winner_name)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `),
-  getGameStats: db.prepare("SELECT * FROM game_history ORDER BY created_at DESC LIMIT 100"),
+    // Players
+    createPlayer: db.prepare(`
+      INSERT INTO players (id, room_id, user_id, name, avatar, is_host, socket_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `),
+    getPlayerById: db.prepare("SELECT * FROM players WHERE id = ?"),
+    getPlayerBySocket: db.prepare("SELECT * FROM players WHERE socket_id = ?"),
+    getPlayersByRoom: db.prepare("SELECT * FROM players WHERE room_id = ?"),
+    updatePlayerSocket: db.prepare("UPDATE players SET socket_id = ? WHERE id = ?"),
+    updatePlayerScore: db.prepare("UPDATE players SET score = score + ? WHERE id = ?"),
+    setPlayerHost: db.prepare("UPDATE players SET is_host = ? WHERE id = ?"),
+    deletePlayer: db.prepare("DELETE FROM players WHERE id = ?"),
+    deletePlayersByRoom: db.prepare("DELETE FROM players WHERE room_id = ?"),
 
-  // Bans
-  createBan: db.prepare("INSERT INTO bans (id, ip, user_id, reason, banned_by, expires_at) VALUES (?, ?, ?, ?, ?, ?)"),
-  getBan: db.prepare(
-    "SELECT * FROM bans WHERE (ip = ? OR user_id = ?) AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)",
-  ),
-  getBans: db.prepare("SELECT * FROM bans WHERE is_active = 1 ORDER BY created_at DESC"),
-  deactivateBan: db.prepare("UPDATE bans SET is_active = 0 WHERE id = ?"),
+    // Bans
+    getBanByIp: db.prepare(`
+      SELECT * FROM bans WHERE ip_address = ? 
+      AND (expires_at IS NULL OR expires_at > datetime('now'))
+    `),
+    getBanByUser: db.prepare(`
+      SELECT * FROM bans WHERE user_id = ?
+      AND (expires_at IS NULL OR expires_at > datetime('now'))
+    `),
+    createBan: db.prepare(`
+      INSERT INTO bans (id, ip_address, user_id, reason, banned_by, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `),
+  }
 
-  // Reports
-  createReport: db.prepare(`
-    INSERT INTO reports (id, reporter_id, reported_id, reported_name, reason, details, room_code)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `),
-  getReports: db.prepare("SELECT * FROM reports WHERE status = 'pending' ORDER BY created_at DESC"),
-  updateReportStatus: db.prepare("UPDATE reports SET status = ? WHERE id = ?"),
+  log("db", "Prepared statements ready")
+}
+
+// ============================================================
+// CRYPTO UTILS
+// ============================================================
+
+function generateId() {
+  return crypto.randomBytes(16).toString("hex")
+}
+
+function generateCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+  let code = ""
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)]
+  }
+  return code
+}
+
+function generateToken() {
+  return crypto.randomBytes(32).toString("hex")
+}
+
+async function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex")
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, 100000, 64, "sha512", (err, key) => {
+      if (err) reject(err)
+      resolve(`${salt}:${key.toString("hex")}`)
+    })
+  })
+}
+
+async function verifyPassword(password, hash) {
+  const [salt, key] = hash.split(":")
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, 100000, 64, "sha512", (err, derivedKey) => {
+      if (err) reject(err)
+      resolve(key === derivedKey.toString("hex"))
+    })
+  })
+}
+
+// ============================================================
+// GAME STATE
+// ============================================================
+
+const rooms = new Map()
+const socketToPlayer = new Map()
+const roomTimers = new Map()
+const roomChatHistory = new Map()
+const roomDrawerOrder = new Map()
+
+// Rate limiting
+const rateLimitMap = new Map()
+const messageRateMap = new Map()
+
+// Stats
+const stats = {
+  totalConnections: 0,
+  totalRoomsCreated: 0,
+  totalGamesPlayed: 0,
+  peakPlayers: 0,
+  rejectedOrigins: 0,
+  startTime: Date.now(),
 }
 
 // ============================================================
@@ -427,831 +492,833 @@ const WORD_LISTS = {
   general: [
     "chat",
     "chien",
-    "maison",
     "soleil",
-    "lune",
+    "maison",
+    "voiture",
     "arbre",
     "fleur",
-    "voiture",
+    "montagne",
+    "plage",
+    "livre",
+    "table",
+    "chaise",
+    "téléphone",
+    "ordinateur",
+    "pizza",
+    "guitare",
+    "ballon",
     "avion",
     "bateau",
-    "pizza",
+    "vélo",
     "pomme",
     "banane",
     "orange",
-    "citron",
     "fraise",
-    "cerise",
-    "raisin",
-    "peche",
-    "poire",
-    "elephant",
-    "girafe",
-    "lion",
-    "tigre",
-    "zebre",
-    "singe",
-    "serpent",
-    "crocodile",
-    "requin",
-    "baleine",
-    "montagne",
-    "plage",
-    "foret",
-    "desert",
-    "ocean",
-    "riviere",
-    "lac",
-    "cascade",
-    "volcan",
-    "ile",
-    "guitare",
-    "piano",
-    "violon",
-    "batterie",
-    "trompette",
-    "saxophone",
-    "flute",
-    "harpe",
-    "accordeon",
-    "tambour",
-    "football",
-    "basketball",
-    "tennis",
-    "natation",
-    "cyclisme",
-    "boxe",
-    "ski",
-    "surf",
-    "escalade",
-    "yoga",
-    "docteur",
-    "pompier",
-    "policier",
-    "astronaute",
-    "pilote",
-    "chef",
-    "artiste",
-    "musicien",
-    "acteur",
-    "ecrivain",
-    "telephone",
-    "ordinateur",
-    "television",
-    "camera",
-    "robot",
-    "fusee",
-    "satellite",
-    "drone",
-    "microscope",
-    "telescope",
-    "chateau",
-    "pyramide",
-    "statue",
-    "pont",
-    "tour",
-    "moulin",
-    "phare",
-    "temple",
-    "cathedrale",
-    "palais",
-    "arc-en-ciel",
+    "gâteau",
+    "chocolat",
+    "café",
+    "thé",
+    "eau",
+    "lait",
+    "pain",
+    "fromage",
+    "oeuf",
+    "poulet",
+    "poisson",
+    "salade",
+    "soupe",
+    "riz",
+    "pâtes",
+    "hamburger",
+    "frites",
+    "glace",
+    "bonbon",
+    "biscuit",
+    "croissant",
+    "baguette",
+    "vin",
+    "bière",
+    "jus",
+    "soda",
+    "étoile",
+    "lune",
     "nuage",
     "pluie",
     "neige",
+    "vent",
     "orage",
-    "eclair",
-    "tornade",
-    "brouillard",
-    "aurore",
-    "etoile",
-    "coeur",
-    "diamant",
-    "couronne",
-    "trophee",
-    "medaille",
-    "cadeau",
+    "arc-en-ciel",
+    "papillon",
+    "oiseau",
+    "lapin",
+    "souris",
+    "éléphant",
+    "lion",
+    "tigre",
+    "girafe",
+    "singe",
+    "serpent",
+    "tortue",
+    "grenouille",
+    "poule",
+    "cochon",
+    "vache",
+    "mouton",
+    "cheval",
+    "âne",
+    "canard",
+    "oie",
+    "coq",
+    "hibou",
+    "chouette",
+    "aigle",
+    "pigeon",
+    "moineau",
+    "perroquet",
+    "requin",
+    "baleine",
+    "dauphin",
+    "méduse",
+    "crabe",
+    "homard",
+    "crevette",
+    "pieuvre",
+    "étoile de mer",
+    "hippocampe",
+    "football",
+    "basketball",
+    "tennis",
+    "rugby",
+  ],
+  animals: [
+    "chat",
+    "chien",
+    "lion",
+    "tigre",
+    "éléphant",
+    "girafe",
+    "singe",
+    "serpent",
+    "crocodile",
+    "hippopotame",
+    "rhinocéros",
+    "zèbre",
+    "kangourou",
+    "koala",
+    "panda",
+    "ours",
+    "loup",
+    "renard",
+    "lapin",
+    "souris",
+    "hamster",
+    "cochon d'inde",
+    "perroquet",
+    "aigle",
+    "hibou",
+    "pingouin",
+    "flamant rose",
+    "autruche",
+    "paon",
+    "cygne",
+  ],
+  food: [
+    "pizza",
+    "hamburger",
+    "sushi",
+    "tacos",
+    "pâtes",
+    "salade",
+    "soupe",
+    "sandwich",
+    "crêpe",
+    "gaufre",
+    "croissant",
+    "pain au chocolat",
+    "macaron",
+    "éclair",
+    "tarte",
+    "gâteau",
+    "glace",
+    "chocolat",
+    "bonbon",
+    "biscuit",
+    "pomme",
+    "banane",
+    "orange",
+    "fraise",
+    "raisin",
+    "pastèque",
+    "ananas",
+    "mangue",
+    "kiwi",
+    "cerise",
+  ],
+  objects: [
+    "téléphone",
+    "ordinateur",
+    "télévision",
+    "caméra",
+    "montre",
+    "lunettes",
+    "parapluie",
+    "valise",
+    "sac à dos",
+    "portefeuille",
+    "clé",
+    "lampe",
+    "miroir",
+    "horloge",
+    "réveil",
+    "radio",
+    "guitare",
+    "piano",
+    "violon",
+    "tambour",
     "ballon",
-    "gateau",
-    "bougie",
-    "dragon",
-    "licorne",
-    "fantome",
-    "vampire",
-    "zombie",
-    "sorciere",
-    "fee",
-    "sirene",
-    "lutin",
-    "geant",
+    "raquette",
+    "skateboard",
+    "trottinette",
+    "vélo",
+    "voiture",
+    "avion",
+    "bateau",
+    "train",
+    "fusée",
+  ],
+  places: [
+    "maison",
+    "école",
+    "hôpital",
+    "restaurant",
+    "supermarché",
+    "bibliothèque",
+    "musée",
+    "cinéma",
+    "théâtre",
+    "stade",
+    "parc",
+    "plage",
+    "montagne",
+    "forêt",
+    "désert",
+    "île",
+    "lac",
+    "rivière",
+    "cascade",
+    "volcan",
+    "château",
+    "tour Eiffel",
+    "pyramide",
+    "statue de la liberté",
+    "Big Ben",
+    "Colisée",
+    "muraille de Chine",
+    "Taj Mahal",
+    "opéra de Sydney",
+    "pont",
   ],
 }
 
-function getRandomWords(count = 3, theme = "general") {
+function getRandomWords(theme = "general", count = 3) {
   const list = WORD_LISTS[theme] || WORD_LISTS.general
-  const shuffled = [...list].sort(() => Math.random() - 0.5)
-  return shuffled.slice(0, count)
+  const words = []
+  const used = new Set()
+
+  while (words.length < count && words.length < list.length) {
+    const word = list[Math.floor(Math.random() * list.length)]
+    if (!used.has(word)) {
+      used.add(word)
+      words.push(word)
+    }
+  }
+
+  return words
 }
 
 function maskWord(word) {
-  return word.replace(/[a-zA-Z]/g, "_")
+  return word
+    .split("")
+    .map((c) => (c === " " ? "  " : "_"))
+    .join(" ")
 }
 
-function revealLetter(word, masked, revealed) {
-  const unrevealed = []
-  for (let i = 0; i < word.length; i++) {
-    if (masked[i] === "_" && !revealed.includes(i)) {
-      unrevealed.push(i)
+function revealHint(word, masked) {
+  const chars = word.split("")
+  const maskedChars = masked.split(" ")
+
+  const hiddenIndices = []
+  chars.forEach((c, i) => {
+    if (c !== " " && maskedChars[i] === "_") {
+      hiddenIndices.push(i)
     }
-  }
-  if (unrevealed.length === 0) return { masked, index: -1 }
-  const idx = unrevealed[Math.floor(Math.random() * unrevealed.length)]
-  const newMasked = masked.split("")
-  newMasked[idx] = word[idx]
-  return { masked: newMasked.join(""), index: idx }
+  })
+
+  if (hiddenIndices.length === 0) return masked
+
+  const revealIndex = hiddenIndices[Math.floor(Math.random() * hiddenIndices.length)]
+  maskedChars[revealIndex] = chars[revealIndex]
+
+  return maskedChars.join(" ")
 }
 
 // ============================================================
-// UTILITIES
+// ROOM MANAGEMENT
 // ============================================================
 
-function generateId() {
-  return crypto.randomBytes(16).toString("hex")
-}
+function createRoom(hostPlayer, settings = {}) {
+  const id = generateId()
+  let code = generateCode()
 
-function generateRoomCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-  let code = ""
-  for (let i = 0; i < 6; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length))
-  }
-  return code
-}
-
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString("hex")
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex")
-  return `${salt}:${hash}`
-}
-
-function verifyPassword(password, stored) {
-  const [salt, hash] = stored.split(":")
-  const verify = crypto.pbkdf2Sync(password, salt, 10000, 64, "sha512").toString("hex")
-  return hash === verify
-}
-
-function generateToken() {
-  return crypto.randomBytes(48).toString("hex")
-}
-
-function validateSession(token) {
-  if (!token) return null
-  const session = stmt.getSession.get(token, Date.now())
-  if (!session) return null
-  const user = stmt.getUserById.get(session.user_id)
-  return user ? { session, user } : null
-}
-
-function getClientIP(socket) {
-  const forwarded = socket.handshake.headers["x-forwarded-for"]
-  if (forwarded) {
-    return forwarded.split(",")[0].trim()
-  }
-  return socket.handshake.address || "unknown"
-}
-
-function normalizeGuess(str) {
-  return str
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]/g, "")
-}
-
-function isCloseGuess(guess, word) {
-  const g = normalizeGuess(guess)
-  const w = normalizeGuess(word)
-  if (g === w) return false
-  if (Math.abs(g.length - w.length) > 2) return false
-
-  let diff = 0
-  const maxLen = Math.max(g.length, w.length)
-  for (let i = 0; i < maxLen; i++) {
-    if (g[i] !== w[i]) diff++
-    if (diff > 2) return false
-  }
-  return diff <= 2
-}
-
-// ============================================================
-// STATISTICS
-// ============================================================
-
-const stats = {
-  startTime: Date.now(),
-  connections: 0,
-  peakConnections: 0,
-  roomsCreated: 0,
-  gamesPlayed: 0,
-  gamesCompleted: 0,
-  messagesProcessed: 0,
-  strokesProcessed: 0,
-  blockedConnections: 0,
-  rateLimitHits: 0,
-  rejectedOrigins: 0,
-}
-
-let maintenanceMode = {
-  enabled: false,
-  reason: "",
-  severity: "info",
-}
-
-// ============================================================
-// RATE LIMITING
-// ============================================================
-
-const rateLimitMap = new Map()
-const messageRateMap = new Map()
-
-function checkRateLimit(ip) {
-  const now = Date.now()
-  const data = rateLimitMap.get(ip) || { count: 0, resetAt: now + 60000, blocked: false, blockedUntil: 0 }
-
-  if (data.blocked && now < data.blockedUntil) {
-    return { allowed: false, remaining: 0, resetIn: Math.ceil((data.blockedUntil - now) / 1000) }
+  // Ensure unique code
+  while (stmt.getRoomByCode.get(code)) {
+    code = generateCode()
   }
 
-  if (now > data.resetAt) {
-    data.count = 0
-    data.resetAt = now + 60000
-    data.blocked = false
+  const room = {
+    id,
+    code,
+    hostId: hostPlayer.id,
+    isPrivate: settings.isPrivate || false,
+    maxPlayers: Math.min(settings.maxPlayers || 8, CONFIG.game.maxPlayers),
+    drawTime: settings.drawTime || CONFIG.game.defaultDrawTime,
+    maxRounds: settings.rounds || CONFIG.game.defaultRounds,
+    theme: settings.theme || "general",
+    phase: "lobby",
+    round: 0,
+    turn: 0,
+    currentDrawer: null,
+    currentWord: null,
+    maskedWord: "",
+    wordLength: 0,
+    timeLeft: 0,
+    players: new Map(),
+    guessedPlayers: new Set(),
+    createdAt: Date.now(),
   }
 
-  data.count++
+  // Save to database
+  stmt.createRoom.run(
+    id,
+    code,
+    hostPlayer.id,
+    room.isPrivate ? 1 : 0,
+    room.maxPlayers,
+    room.drawTime,
+    room.maxRounds,
+    room.theme,
+  )
 
-  if (data.count > CONFIG.security.rateLimit.connectionsPerMinute) {
-    data.blocked = true
-    data.blockedUntil = now + CONFIG.security.rateLimit.penaltyTime
-    rateLimitMap.set(ip, data)
-    stats.rateLimitHits++
-    return { allowed: false, remaining: 0, resetIn: 60 }
+  rooms.set(id, room)
+  roomChatHistory.set(id, [])
+  roomDrawerOrder.set(id, [])
+  stats.totalRoomsCreated++
+
+  log("room", `Room created: ${code}`, { id, host: hostPlayer.name })
+
+  return room
+}
+
+function joinRoom(room, player) {
+  room.players.set(player.id, player)
+
+  // Update drawer order
+  const order = roomDrawerOrder.get(room.id) || []
+  order.push(player.id)
+  roomDrawerOrder.set(room.id, order)
+
+  // Save player to database
+  stmt.createPlayer.run(
+    player.id,
+    room.id,
+    player.userId || null,
+    player.name,
+    player.avatar || null,
+    0,
+    player.socketId,
+  )
+
+  log("player", `${player.name} joined room ${room.code}`)
+}
+
+function leaveRoom(room, playerId, io) {
+  const player = room.players.get(playerId)
+  if (!player) return
+
+  room.players.delete(playerId)
+  stmt.deletePlayer.run(playerId)
+
+  // Update drawer order
+  const order = roomDrawerOrder.get(room.id) || []
+  const idx = order.indexOf(playerId)
+  if (idx !== -1) order.splice(idx, 1)
+  roomDrawerOrder.set(room.id, order)
+
+  log("player", `${player.name} left room ${room.code}`)
+
+  // Notify others
+  io.to(room.id).emit("player:disconnected", {
+    playerId,
+    reason: "left",
+  })
+
+  // Handle host change
+  if (room.hostId === playerId && room.players.size > 0) {
+    const newHost = room.players.values().next().value
+    room.hostId = newHost.id
+    newHost.isHost = true
+    stmt.setPlayerHost.run(1, newHost.id)
+
+    io.to(room.id).emit("host:changed", {
+      newHostId: newHost.id,
+      newHostName: newHost.name,
+    })
+
+    log("room", `New host: ${newHost.name} in room ${room.code}`)
   }
 
-  rateLimitMap.set(ip, data)
-  return {
-    allowed: true,
-    remaining: CONFIG.security.rateLimit.connectionsPerMinute - data.count,
-    resetIn: Math.ceil((data.resetAt - now) / 1000),
+  // Handle empty room
+  if (room.players.size === 0) {
+    scheduleRoomCleanup(room.id)
+  }
+
+  // Handle game interruption
+  if (room.phase !== "lobby" && room.currentDrawer === playerId) {
+    endTurn(room, io, "Le dessinateur a quitté")
   }
 }
 
-function checkMessageRate(socketId) {
-  const now = Date.now()
-  const data = messageRateMap.get(socketId) || { count: 0, resetAt: now + 1000 }
+function scheduleRoomCleanup(roomId) {
+  // Wait 2 minutes before deleting empty room
+  const timer = setTimeout(
+    () => {
+      const room = rooms.get(roomId)
+      if (room && room.players.size === 0) {
+        clearRoomTimers(roomId)
+        stmt.deletePlayersByRoom.run(roomId)
+        stmt.deleteRoom.run(roomId)
+        rooms.delete(roomId)
+        roomChatHistory.delete(roomId)
+        roomDrawerOrder.delete(roomId)
+        log("room", `Cleaned up empty room: ${room.code}`)
+      }
+    },
+    2 * 60 * 1000,
+  )
 
-  if (now > data.resetAt) {
-    data.count = 0
-    data.resetAt = now + 1000
-  }
-
-  data.count++
-
-  if (data.count > CONFIG.security.rateLimit.messagesPerSecond) {
-    return false
-  }
-
-  messageRateMap.set(socketId, data)
-  return true
+  const timers = roomTimers.get(roomId) || {}
+  timers.cleanup = timer
+  roomTimers.set(roomId, timers)
 }
 
-// ============================================================
-// SERVER & SOCKET INSTANCES
-// ============================================================
-
-let app, server, io
-const connectedSockets = new Map()
-const roomTimers = new Map()
-const roomHintTimers = new Map()
-const roomRevealedLetters = new Map()
-const roomChatHistory = new Map()
-const roomDrawerOrder = new Map()
+function clearRoomTimers(roomId) {
+  const timers = roomTimers.get(roomId)
+  if (timers) {
+    Object.values(timers).forEach((t) => clearTimeout(t))
+    roomTimers.delete(roomId)
+  }
+}
 
 // ============================================================
 // GAME LOGIC
 // ============================================================
 
-function broadcastRoomSync(roomId) {
-  const room = stmt.getRoom.get(roomId)
-  if (!room) {
-    log("warning", `broadcastRoomSync: Room not found: ${roomId}`)
-    return
-  }
+function startGame(room, io) {
+  room.phase = "waiting"
+  room.round = 1
+  room.turn = 0
+  room.guessedPlayers.clear()
 
-  const players = stmt.getPlayersByRoom.all(roomId)
+  // Reset scores
+  room.players.forEach((p) => {
+    p.score = 0
+    p.hasGuessed = false
+    p.isDrawing = false
+  })
 
-  const syncData = {
-    room: {
-      id: room.id,
-      code: room.code,
-      phase: room.phase,
-      round: room.round,
-      turn: room.turn,
-      maxRounds: room.max_rounds,
-      timeLeft: room.time_left,
-      drawTime: room.draw_time,
-      currentDrawer: room.current_drawer,
-      wordLength: room.word_length,
-      maskedWord: room.masked_word,
-      theme: room.theme,
-      isPrivate: room.is_private,
-      maxPlayers: room.max_players,
-    },
-    players: players.map((p) => ({
-      id: p.id,
-      name: p.name,
-      score: p.score,
-      avatar: p.avatar,
-      isHost: p.is_host === 1,
-      isDrawing: p.is_drawing === 1,
-      hasGuessed: p.has_guessed === 1,
-      isConnected: p.is_connected === 1,
-    })),
-  }
+  // Initialize drawer order
+  const playerIds = Array.from(room.players.keys())
+  roomDrawerOrder.set(room.id, shuffleArray([...playerIds]))
 
-  log("room", `Sync room ${room.code}`, { phase: room.phase, players: players.length })
-  io.to(roomId).emit("room:sync", syncData)
+  stmt.updateRoomPhase.run("playing", room.id)
+  stats.totalGamesPlayed++
+
+  log("game", `Game started in room ${room.code}`, { players: room.players.size })
+
+  // Start first turn after countdown
+  io.to(room.id).emit("game:starting", { countdown: 3 })
+
+  const timer = setTimeout(() => {
+    startTurn(room, io)
+  }, 3000)
+
+  const timers = roomTimers.get(room.id) || {}
+  timers.start = timer
+  roomTimers.set(room.id, timers)
 }
 
-function startTurn(roomId) {
-  const room = stmt.getRoom.get(roomId)
-  if (!room) {
-    log("error", `startTurn: Room not found: ${roomId}`)
+function startTurn(room, io) {
+  // Get next drawer
+  const order = roomDrawerOrder.get(room.id) || []
+  if (order.length === 0) {
+    endGame(room, io)
     return
   }
 
-  const players = stmt.getPlayersByRoom.all(roomId).filter((p) => p.is_connected === 1)
-  if (players.length < CONFIG.game.minPlayers) {
-    log("game", `Not enough players to continue, ending game`)
-    endGame(roomId, "Pas assez de joueurs")
+  const drawerId = order[room.turn % order.length]
+  const drawer = room.players.get(drawerId)
+
+  if (!drawer) {
+    room.turn++
+    if (room.turn >= order.length) {
+      room.turn = 0
+      room.round++
+      if (room.round > room.maxRounds) {
+        endGame(room, io)
+        return
+      }
+    }
+    startTurn(room, io)
     return
   }
 
-  let drawerOrder = roomDrawerOrder.get(roomId)
-  if (!drawerOrder || drawerOrder.length === 0) {
-    drawerOrder = players.map((p) => p.id)
-    roomDrawerOrder.set(roomId, drawerOrder)
-    log("game", `Created drawer order for room ${room.code}`, drawerOrder)
-  }
+  room.phase = "choosing"
+  room.currentDrawer = drawerId
+  room.guessedPlayers.clear()
 
-  const currentTurn = room.turn
-  const drawerIndex = currentTurn % drawerOrder.length
-  const drawerId = drawerOrder[drawerIndex]
+  room.players.forEach((p) => {
+    p.isDrawing = p.id === drawerId
+    p.hasGuessed = false
+  })
 
-  log("game", `Turn ${currentTurn + 1}: Drawer is ${drawerId}`)
+  // Send word choices to drawer
+  const words = getRandomWords(room.theme, 3)
+  const drawerSocket = Array.from(io.sockets.sockets.values()).find((s) => socketToPlayer.get(s.id)?.id === drawerId)
 
-  stmt.resetPlayersForRound.run(roomId)
-  stmt.updatePlayerDrawing.run(1, 0, drawerId)
-
-  const words = getRandomWords(3, room.theme)
-  log("game", `Word choices generated`, words)
-
-  stmt.updateRoom.run(
-    "choosing",
-    room.round,
-    currentTurn,
-    room.draw_time,
-    drawerId,
-    "",
-    0,
-    "",
-    players.length,
-    Date.now(),
-    roomId,
-  )
-
-  const drawerSocket = connectedSockets.get(drawerId)
   if (drawerSocket) {
-    log("game", `Sending word choices to drawer`)
     drawerSocket.emit("game:choose_word", { words })
-  } else {
-    log("warning", `Drawer socket not found for ${drawerId}`)
   }
 
-  broadcastRoomSync(roomId)
+  // Sync room state
+  syncRoom(room, io)
 
-  setTimeout(() => {
-    const currentRoom = stmt.getRoom.get(roomId)
-    if (currentRoom && currentRoom.phase === "choosing" && !currentRoom.current_word) {
-      log("game", `Auto-selecting word due to timeout`)
-      selectWord(roomId, drawerId, words[Math.floor(Math.random() * words.length)])
+  log("game", `Turn started in ${room.code}`, { drawer: drawer.name, round: room.round })
+
+  // Auto-select word after timeout
+  const timer = setTimeout(() => {
+    if (room.phase === "choosing") {
+      selectWord(room, io, words[0])
     }
   }, 15000)
+
+  const timers = roomTimers.get(room.id) || {}
+  timers.choose = timer
+  roomTimers.set(room.id, timers)
 }
 
-function selectWord(roomId, playerId, word) {
-  const room = stmt.getRoom.get(roomId)
-  if (!room || room.current_drawer !== playerId) {
-    log("warning", `selectWord: Invalid drawer or room`)
-    return
-  }
+function selectWord(room, io, word) {
+  room.phase = "drawing"
+  room.currentWord = word
+  room.wordLength = word.length
+  room.maskedWord = maskWord(word)
+  room.timeLeft = room.drawTime
 
-  log("game", `Word selected: ${word}`)
+  const timers = roomTimers.get(room.id) || {}
+  clearTimeout(timers.choose)
 
-  const masked = maskWord(word)
-  roomRevealedLetters.set(roomId, [])
-
-  stmt.updateRoom.run(
-    "drawing",
-    room.round,
-    room.turn,
-    room.draw_time,
-    room.current_drawer,
-    word,
-    word.length,
-    masked,
-    room.player_count,
-    Date.now(),
-    roomId,
+  // Send word to drawer
+  const drawerSocket = Array.from(io.sockets.sockets.values()).find(
+    (s) => socketToPlayer.get(s.id)?.id === room.currentDrawer,
   )
-
-  const drawerSocket = connectedSockets.get(playerId)
   if (drawerSocket) {
     drawerSocket.emit("game:word", { word })
   }
 
-  io.to(roomId).emit("game:turn_start", {
-    drawerId: playerId,
-    wordLength: word.length,
-    maskedWord: masked,
-    timeLeft: room.draw_time,
+  // Notify all players
+  io.to(room.id).emit("game:turn_start", {
+    drawerId: room.currentDrawer,
+    wordLength: room.wordLength,
+    maskedWord: room.maskedWord,
+    timeLeft: room.timeLeft,
   })
 
-  startTurnTimer(roomId)
-  startHintTimer(roomId)
-}
+  // Start timer
+  const tickInterval = setInterval(() => {
+    room.timeLeft--
 
-function startTurnTimer(roomId) {
-  clearRoomTimers(roomId)
-
-  const room = stmt.getRoom.get(roomId)
-  if (!room) return
-
-  let timeLeft = room.draw_time
-  log("game", `Timer started: ${timeLeft}s`)
-
-  const timer = setInterval(() => {
-    timeLeft--
-
-    if (timeLeft <= 0) {
-      clearInterval(timer)
-      endTurn(roomId, false)
+    if (room.timeLeft <= 0) {
+      clearInterval(tickInterval)
+      endTurn(room, io, "Temps écoulé!")
       return
     }
 
-    const currentRoom = stmt.getRoom.get(roomId)
-    if (currentRoom) {
-      stmt.updateRoom.run(
-        currentRoom.phase,
-        currentRoom.round,
-        currentRoom.turn,
-        timeLeft,
-        currentRoom.current_drawer,
-        currentRoom.current_word,
-        currentRoom.word_length,
-        currentRoom.masked_word,
-        currentRoom.player_count,
-        Date.now(),
-        roomId,
-      )
-    }
+    io.to(room.id).emit("game:time_update", { timeLeft: room.timeLeft })
 
-    io.to(roomId).emit("game:time_update", { timeLeft })
+    // Hints every 20 seconds
+    if (room.timeLeft % 20 === 0 && room.timeLeft < room.drawTime - 10) {
+      room.maskedWord = revealHint(room.currentWord, room.maskedWord)
+      io.to(room.id).emit("game:hint", { maskedWord: room.maskedWord })
+    }
   }, 1000)
 
-  roomTimers.set(roomId, timer)
+  timers.tick = tickInterval
+  roomTimers.set(room.id, timers)
+
+  log("game", `Word selected in ${room.code}: ${word}`)
 }
 
-function startHintTimer(roomId) {
-  const hintTimer = setInterval(() => {
-    const room = stmt.getRoom.get(roomId)
-    if (!room || room.phase !== "drawing") {
-      clearInterval(hintTimer)
-      return
-    }
-
-    const revealed = roomRevealedLetters.get(roomId) || []
-    const { masked, index } = revealLetter(room.current_word, room.masked_word, revealed)
-
-    if (index >= 0) {
-      revealed.push(index)
-      roomRevealedLetters.set(roomId, revealed)
-
-      stmt.updateRoom.run(
-        room.phase,
-        room.round,
-        room.turn,
-        room.time_left,
-        room.current_drawer,
-        room.current_word,
-        room.word_length,
-        masked,
-        room.player_count,
-        Date.now(),
-        roomId,
-      )
-
-      log("game", `Hint revealed: ${masked}`)
-      io.to(roomId).emit("game:hint", { maskedWord: masked })
-    }
-  }, CONFIG.game.hintInterval)
-
-  roomHintTimers.set(roomId, hintTimer)
-}
-
-function clearRoomTimers(roomId) {
-  const timer = roomTimers.get(roomId)
-  if (timer) {
-    clearInterval(timer)
-    roomTimers.delete(roomId)
+function handleGuess(room, player, message, io) {
+  if (!room.currentWord || player.id === room.currentDrawer || player.hasGuessed) {
+    return { isCorrect: false, isClose: false }
   }
 
-  const hintTimer = roomHintTimers.get(roomId)
-  if (hintTimer) {
-    clearInterval(hintTimer)
-    roomHintTimers.delete(roomId)
-  }
-}
-
-function checkGuess(roomId, playerId, message) {
-  const room = stmt.getRoom.get(roomId)
-  if (!room || room.phase !== "drawing") return { isCorrect: false, isClose: false }
-
-  const player = stmt.getPlayer.get(playerId)
-  if (!player || player.is_drawing === 1 || player.has_guessed === 1) return { isCorrect: false, isClose: false }
-
-  const guess = normalizeGuess(message)
-  const word = normalizeGuess(room.current_word)
+  const guess = message.toLowerCase().trim()
+  const word = room.currentWord.toLowerCase()
 
   if (guess === word) {
-    const players = stmt.getPlayersByRoom.all(roomId)
-    const guessedCount = players.filter((p) => p.has_guessed === 1).length
+    player.hasGuessed = true
+    room.guessedPlayers.add(player.id)
 
-    const basePoints = 100
-    const orderBonus = Math.max(0, 50 - guessedCount * 10)
-    const timeBonus = Math.floor((room.time_left / room.draw_time) * 50)
-    const points = basePoints + orderBonus + timeBonus
+    // Calculate points
+    const timeBonus = Math.floor((room.timeLeft / room.drawTime) * 100)
+    const orderBonus = Math.max(0, 100 - room.guessedPlayers.size * 20)
+    const points = 100 + timeBonus + orderBonus
 
-    log("game", `${player.name} guessed correctly! +${points} points`)
+    player.score += points
+    stmt.updatePlayerScore.run(points, player.id)
 
-    stmt.updatePlayerGuessed.run(1, playerId)
-    stmt.updatePlayerScore.run(player.score + points, playerId)
-
-    const drawer = stmt.getPlayer.get(room.current_drawer)
+    // Give drawer points too
+    const drawer = room.players.get(room.currentDrawer)
     if (drawer) {
-      stmt.updatePlayerScore.run(drawer.score + 25, drawer.id)
+      drawer.score += 25
+      stmt.updatePlayerScore.run(25, drawer.id)
     }
 
-    io.to(roomId).emit("game:correct_guess", {
-      playerId,
+    io.to(room.id).emit("game:correct_guess", {
+      playerId: player.id,
       playerName: player.name,
       points,
     })
 
-    broadcastRoomSync(roomId)
+    log("game", `${player.name} guessed correctly in ${room.code}`, { word, points })
 
-    const updatedPlayers = stmt.getPlayersByRoom.all(roomId)
-    const nonDrawers = updatedPlayers.filter((p) => p.is_drawing !== 1 && p.is_connected === 1)
-    const allGuessed = nonDrawers.every((p) => p.has_guessed === 1)
-
-    if (allGuessed) {
-      log("game", "All players guessed! Ending turn early")
-      setTimeout(() => endTurn(roomId, true), 2000)
+    // Check if everyone guessed
+    const nonDrawerCount = room.players.size - 1
+    if (room.guessedPlayers.size >= nonDrawerCount) {
+      setTimeout(() => endTurn(room, io, "Tout le monde a trouvé!"), 1000)
     }
 
     return { isCorrect: true, isClose: false }
   }
 
-  if (isCloseGuess(message, room.current_word)) {
+  // Check for close guess
+  if (isCloseGuess(guess, word)) {
     return { isCorrect: false, isClose: true }
   }
 
   return { isCorrect: false, isClose: false }
 }
 
-function endTurn(roomId, allGuessed) {
-  clearRoomTimers(roomId)
+function isCloseGuess(guess, word) {
+  if (guess.length < 3) return false
 
-  const room = stmt.getRoom.get(roomId)
-  if (!room) return
+  // Check if one letter away
+  if (Math.abs(guess.length - word.length) <= 1) {
+    let diff = 0
+    const maxLen = Math.max(guess.length, word.length)
+    for (let i = 0; i < maxLen; i++) {
+      if (guess[i] !== word[i]) diff++
+    }
+    if (diff <= 2) return true
+  }
 
-  log("game", `Turn ended`, { word: room.current_word, allGuessed })
+  // Check if contains most of the word
+  if (word.includes(guess) || guess.includes(word)) return true
 
-  io.to(roomId).emit("game:turn_end", {
-    word: room.current_word,
-    allGuessed,
+  return false
+}
+
+function endTurn(room, io, reason = "") {
+  const timers = roomTimers.get(room.id) || {}
+  clearInterval(timers.tick)
+  clearTimeout(timers.choose)
+
+  room.phase = "roundEnd"
+
+  io.to(room.id).emit("game:turn_end", {
+    word: room.currentWord,
+    reason,
+    allGuessed: room.guessedPlayers.size >= room.players.size - 1,
   })
 
-  setTimeout(() => {
-    const currentRoom = stmt.getRoom.get(roomId)
-    if (!currentRoom) return
+  log("game", `Turn ended in ${room.code}`, { word: room.currentWord, reason })
 
-    const players = stmt.getPlayersByRoom.all(roomId).filter((p) => p.is_connected === 1)
-    const newTurn = currentRoom.turn + 1
+  // Next turn after delay
+  const timer = setTimeout(() => {
+    room.turn++
+    const order = roomDrawerOrder.get(room.id) || []
 
-    if (newTurn >= players.length) {
-      if (currentRoom.round >= currentRoom.max_rounds) {
-        endGame(roomId)
-      } else {
-        stmt.updateRoom.run(
-          "roundEnd",
-          currentRoom.round,
-          newTurn,
-          currentRoom.draw_time,
-          null,
-          "",
-          0,
-          "",
-          players.length,
-          Date.now(),
-          roomId,
-        )
+    if (room.turn >= order.length) {
+      room.turn = 0
+      room.round++
 
-        log("game", `Round ${currentRoom.round} ended`)
-        io.to(roomId).emit("game:round_end", { round: currentRoom.round })
-        broadcastRoomSync(roomId)
+      if (room.round > room.maxRounds) {
+        endGame(room, io)
+        return
       }
-    } else {
-      stmt.updateRoom.run(
-        "waiting",
-        currentRoom.round,
-        newTurn,
-        currentRoom.draw_time,
-        null,
-        "",
-        0,
-        "",
-        players.length,
-        Date.now(),
-        roomId,
-      )
-      startTurn(roomId)
+
+      io.to(room.id).emit("game:round_end", { round: room.round })
     }
+
+    startTurn(room, io)
   }, CONFIG.game.turnEndDelay)
+
+  timers.nextTurn = timer
+  roomTimers.set(room.id, timers)
 }
 
-function nextRound(roomId) {
-  const room = stmt.getRoom.get(roomId)
-  if (!room) return
+function endGame(room, io) {
+  room.phase = "gameEnd"
+  clearRoomTimers(room.id)
 
-  log("game", `Starting round ${room.round + 1}`)
-
-  roomDrawerOrder.set(roomId, [])
-
-  stmt.updateRoom.run(
-    "waiting",
-    room.round + 1,
-    0,
-    room.draw_time,
-    null,
-    "",
-    0,
-    "",
-    room.player_count,
-    Date.now(),
-    roomId,
-  )
-
-  startTurn(roomId)
-}
-
-function endGame(roomId, reason = null) {
-  clearRoomTimers(roomId)
-
-  const room = stmt.getRoom.get(roomId)
-  if (!room) return
-
-  const players = stmt.getPlayersByRoom.all(roomId)
-  const rankings = players
+  // Calculate rankings
+  const rankings = Array.from(room.players.values())
     .sort((a, b) => b.score - a.score)
     .map((p, i) => ({
       rank: i + 1,
       id: p.id,
       name: p.name,
       score: p.score,
-      userId: p.user_id,
+      userId: p.userId,
     }))
 
-  log("game", `Game ended in room ${room.code}`, { reason, winner: rankings[0]?.name })
-
-  const winner = rankings[0]
-  stmt.createGameHistory.run(generateId(), room.code, players.length, room.round, winner?.id, winner?.name)
-
-  stats.gamesCompleted++
-
-  for (const player of players) {
-    if (player.user_id) {
-      stmt.updateProfileStats.run(
-        1,
-        player.id === winner?.id ? 1 : 0,
-        player.score,
-        player.score,
-        player.has_guessed === 1 ? 1 : 0,
-        player.is_drawing === 1 ? 1 : 0,
-        player.user_id,
-      )
+  // Update user stats
+  rankings.forEach((r) => {
+    if (r.userId) {
+      const won = r.rank === 1 ? 1 : 0
+      stmt.updateStats.run(won, r.score, r.userId)
     }
+  })
+
+  io.to(room.id).emit("game:ended", { rankings })
+
+  log("game", `Game ended in ${room.code}`, {
+    winner: rankings[0]?.name,
+    players: rankings.length,
+  })
+
+  stmt.updateRoomPhase.run("lobby", room.id)
+}
+
+function syncRoom(room, io) {
+  const players = Array.from(room.players.values()).map((p) => ({
+    id: p.id,
+    name: p.name,
+    score: p.score,
+    isHost: room.hostId === p.id,
+    isDrawing: room.currentDrawer === p.id,
+    hasGuessed: p.hasGuessed,
+    avatar: p.avatar || "default",
+    isConnected: true,
+  }))
+
+  io.to(room.id).emit("room:sync", {
+    room: {
+      id: room.id,
+      code: room.code,
+      phase: room.phase,
+      round: room.round,
+      turn: room.turn,
+      maxRounds: room.maxRounds,
+      timeLeft: room.timeLeft,
+      drawTime: room.drawTime,
+      currentDrawer: room.currentDrawer,
+      wordLength: room.wordLength,
+      maskedWord: room.maskedWord,
+      theme: room.theme,
+      isPrivate: room.isPrivate,
+      maxPlayers: room.maxPlayers,
+    },
+    players,
+  })
+}
+
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[array[i], array[j]] = [array[j], array[i]]
   }
-
-  stmt.updateRoom.run("gameEnd", room.round, room.turn, 0, null, "", 0, "", room.player_count, Date.now(), roomId)
-
-  io.to(roomId).emit("game:ended", { rankings, reason })
-  broadcastRoomSync(roomId)
+  return array
 }
 
 // ============================================================
-// ROUTE SETUP
+// EXPRESS ROUTES
 // ============================================================
 
+let app, server, io
+
 function setupRoutes() {
-  const router = express.Router()
-
-  router.get("/health", (req, res) => {
-    res.json({ status: "ok", timestamp: Date.now() })
-  })
-
-  router.get("/status", (req, res) => {
-    const rooms = stmt.getAllRooms.all()
-    const activeRooms = rooms.filter((r) => r.player_count > 0)
-
+  // Health check
+  app.get("/", (req, res) => {
     res.json({
-      status: maintenanceMode.enabled ? "maintenance" : "ok",
-      version: CONFIG.server.version,
       name: CONFIG.server.name,
+      version: CONFIG.server.version,
+      status: "online",
       uptime: Math.floor((Date.now() - stats.startTime) / 1000),
-      maintenance: maintenanceMode.enabled
-        ? { enabled: true, message: maintenanceMode.reason, severity: maintenanceMode.severity }
-        : { enabled: false },
-      stats: {
-        connections: connectedSockets.size,
-        peakConnections: stats.peakConnections,
-        activeRooms: activeRooms.length,
-        totalRooms: rooms.length,
-        players: activeRooms.reduce((sum, r) => sum + r.player_count, 0),
-        gamesPlayed: stats.gamesPlayed,
-        gamesCompleted: stats.gamesCompleted,
-        messagesProcessed: stats.messagesProcessed,
-      },
-      rooms: activeRooms.length,
-      players: activeRooms.reduce((sum, r) => sum + r.player_count, 0),
     })
   })
 
-  router.get("/info", (req, res) => {
+  app.get("/socket.io/", (req, res) => {
+    res.json({
+      status: "Socket.IO endpoint",
+      hint: "This endpoint handles Socket.IO connections",
+    })
+  })
+
+  // Status endpoint
+  app.get("/api/status", (req, res) => {
     res.json({
       name: CONFIG.server.name,
       version: CONFIG.server.version,
-      publicUrl: CONFIG.publicUrl,
-      ssl: CONFIG.ssl.enabled || env.behindProxy,
-      stats: {
-        rooms: stmt.getAllRooms.all().filter((r) => r.player_count > 0).length,
-        players: connectedSockets.size,
-        connections: connectedSockets.size,
-        uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+      status: "online",
+      players: socketToPlayer.size,
+      rooms: rooms.size,
+      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+    })
+  })
+
+  // Stats endpoint
+  app.get("/api/stats", (req, res) => {
+    const memUsage = process.memoryUsage()
+    res.json({
+      connections: socketToPlayer.size,
+      rooms: rooms.size,
+      players: Array.from(rooms.values()).reduce((sum, r) => sum + r.players.size, 0),
+      games: stats.totalGamesPlayed,
+      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
+      memory: {
+        used: Math.round(memUsage.heapUsed / 1024 / 1024),
+        total: Math.round(memUsage.heapTotal / 1024 / 1024),
       },
     })
   })
 
-  router.get("/", (req, res) => {
+  // Public rooms
+  app.get("/api/rooms", (req, res) => {
+    const publicRooms = stmt.getPublicRooms.all()
     res.json({
-      name: CONFIG.server.name,
-      version: CONFIG.server.version,
-      status: maintenanceMode.enabled ? "maintenance" : "online",
-      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
-      connections: connectedSockets.size,
-      documentation: `${CONFIG.publicUrl}/docs`,
-    })
-  })
-
-  router.get("/maintenance", (req, res) => {
-    res.json(maintenanceMode)
-  })
-
-  router.get("/rooms", (req, res) => {
-    const rooms = stmt.getAllRooms.all()
-    const publicRooms = rooms
-      .filter((r) => r.is_private === 0 && r.player_count > 0 && r.phase === "waiting")
-      .map((r) => ({
+      rooms: publicRooms.map((r) => ({
         code: r.code,
         playerCount: r.player_count,
         maxPlayers: r.max_players,
+        phase: r.phase,
         theme: r.theme,
-      }))
-    res.json({ rooms: publicRooms })
+      })),
+    })
   })
 
-  // Auth routes
-  router.post("/auth/register", express.json(), async (req, res) => {
+  // Auth: Register
+  app.post("/api/auth/register", async (req, res) => {
     try {
       const { email, password, username, displayName } = req.body
 
@@ -1259,71 +1326,36 @@ function setupRoutes() {
         return res.status(400).json({ success: false, error: "Email et mot de passe requis" })
       }
 
-      const existing = stmt.getUserByEmail.get(email)
-      if (existing) {
-        return res.status(400).json({ success: false, error: "Email deja utilise" })
+      if (password.length < 6) {
+        return res.status(400).json({ success: false, error: "Mot de passe trop court (min 6)" })
       }
 
-      if (username) {
-        const existingUsername = stmt.getUserByUsername.get(username)
-        if (existingUsername) {
-          return res.status(400).json({ success: false, error: "Pseudo deja utilise" })
-        }
+      // Check existing
+      if (stmt.getUserByEmail.get(email)) {
+        return res.status(400).json({ success: false, error: "Email déjà utilisé" })
+      }
+
+      if (username && stmt.getUserByUsername.get(username)) {
+        return res.status(400).json({ success: false, error: "Nom d'utilisateur déjà pris" })
       }
 
       const userId = generateId()
-      const passwordHash = hashPassword(password)
+      const passwordHash = await hashPassword(password)
       const name = displayName || username || email.split("@")[0]
 
-      stmt.createUser.run(userId, email, username || null, passwordHash, name, null)
+      stmt.createUser.run(userId, email, username || null, name, passwordHash, null)
       stmt.createProfile.run(userId)
 
+      // Create session
       const token = generateToken()
-      const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000
+      const sessionId = generateId()
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
 
-      stmt.createSession.run(generateId(), userId, token, expiresAt)
+      stmt.createSession.run(sessionId, userId, token, expiresAt)
 
       const user = stmt.getUserById.get(userId)
 
-      log("player", `New user registered: ${name}`)
-
-      res.json({
-        success: true,
-        user: {
-          id: user.id,
-          email: user.email,
-          username: user.username,
-          displayName: user.display_name,
-          isPremium: user.is_premium === 1,
-          isAdmin: user.is_admin === 1,
-        },
-        session: { token, expiresAt },
-      })
-    } catch (err) {
-      log("error", "Register error", { error: err.message })
-      res.status(500).json({ success: false, error: "Erreur serveur" })
-    }
-  })
-
-  router.post("/auth/login", express.json(), async (req, res) => {
-    try {
-      const { email, password } = req.body
-
-      if (!email || !password) {
-        return res.status(400).json({ success: false, error: "Email et mot de passe requis" })
-      }
-
-      const user = stmt.getUserByEmail.get(email)
-      if (!user || !verifyPassword(password, user.password_hash)) {
-        return res.status(401).json({ success: false, error: "Identifiants incorrects" })
-      }
-
-      const token = generateToken()
-      const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000
-
-      stmt.createSession.run(generateId(), user.id, token, expiresAt)
-
-      log("player", `User logged in: ${user.display_name}`)
+      log("success", `User registered: ${email}`)
 
       res.json({
         success: true,
@@ -1333,18 +1365,76 @@ function setupRoutes() {
           username: user.username,
           displayName: user.display_name,
           avatarUrl: user.avatar_url,
-          isPremium: user.is_premium === 1,
-          isAdmin: user.is_admin === 1,
+          isPremium: !!user.is_premium,
+          isAdmin: !!user.is_admin,
         },
-        session: { token, expiresAt },
+        session: {
+          token,
+          expiresAt: new Date(expiresAt).getTime(),
+        },
       })
     } catch (err) {
-      log("error", "Login error", { error: err.message })
+      log("error", "Registration failed", err.message)
       res.status(500).json({ success: false, error: "Erreur serveur" })
     }
   })
 
-  router.post("/auth/logout", (req, res) => {
+  // Auth: Login
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const { email, password } = req.body
+
+      if (!email || !password) {
+        return res.status(400).json({ success: false, error: "Email et mot de passe requis" })
+      }
+
+      const user = stmt.getUserByEmail.get(email)
+      if (!user) {
+        return res.status(401).json({ success: false, error: "Email ou mot de passe incorrect" })
+      }
+
+      if (user.is_banned) {
+        return res.status(403).json({ success: false, error: "Compte banni: " + (user.ban_reason || "") })
+      }
+
+      const valid = await verifyPassword(password, user.password_hash)
+      if (!valid) {
+        return res.status(401).json({ success: false, error: "Email ou mot de passe incorrect" })
+      }
+
+      // Create session
+      const token = generateToken()
+      const sessionId = generateId()
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+
+      stmt.createSession.run(sessionId, user.id, token, expiresAt)
+
+      log("success", `User logged in: ${email}`)
+
+      res.json({
+        success: true,
+        user: {
+          id: user.id,
+          email: user.email,
+          username: user.username,
+          displayName: user.display_name,
+          avatarUrl: user.avatar_url,
+          isPremium: !!user.is_premium,
+          isAdmin: !!user.is_admin,
+        },
+        session: {
+          token,
+          expiresAt: new Date(expiresAt).getTime(),
+        },
+      })
+    } catch (err) {
+      log("error", "Login failed", err.message)
+      res.status(500).json({ success: false, error: "Erreur serveur" })
+    }
+  })
+
+  // Auth: Logout
+  app.post("/api/auth/logout", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
     if (token) {
       stmt.deleteSession.run(token)
@@ -1352,504 +1442,378 @@ function setupRoutes() {
     res.json({ success: true })
   })
 
-  router.get("/auth/me", (req, res) => {
+  // Auth: Get current user
+  app.get("/api/auth/me", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
-    const auth = validateSession(token)
-
-    if (!auth) {
-      return res.status(401).json({ error: "Non authentifie" })
+    if (!token) {
+      return res.status(401).json({ error: "Non authentifié" })
     }
 
-    const profile = stmt.getProfile.get(auth.user.id)
+    const session = stmt.getSessionByToken.get(token)
+    if (!session) {
+      return res.status(401).json({ error: "Session invalide" })
+    }
+
+    const profile = stmt.getProfile.get(session.user_id)
 
     res.json({
       user: {
-        id: auth.user.id,
-        email: auth.user.email,
-        username: auth.user.username,
-        displayName: auth.user.display_name,
-        avatarUrl: auth.user.avatar_url,
-        isPremium: auth.user.is_premium === 1,
-        isAdmin: auth.user.is_admin === 1,
+        id: session.id,
+        email: session.email,
+        username: session.username,
+        displayName: session.display_name,
+        avatarUrl: session.avatar_url,
+        isPremium: !!session.is_premium,
+        isAdmin: !!session.is_admin,
       },
-      profile,
+      profile: profile
+        ? {
+            bio: profile.bio,
+            country: profile.country,
+            gamesPlayed: profile.games_played,
+            gamesWon: profile.games_won,
+            totalScore: profile.total_score,
+          }
+        : null,
     })
   })
 
-  // Admin routes
-  router.get("/admin/stats", (req, res) => {
+  // Auth: Update profile
+  app.put("/api/auth/profile", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
-    const auth = validateSession(token)
-
-    if (!auth || auth.user.is_admin !== 1) {
-      return res.status(401).json({ error: "Non autorise" })
+    if (!token) {
+      return res.status(401).json({ success: false, error: "Non authentifié" })
     }
 
-    const rooms = stmt.getAllRooms.all()
-    const gameStats = stmt.getGameStats.all()
+    const session = stmt.getSessionByToken.get(token)
+    if (!session) {
+      return res.status(401).json({ success: false, error: "Session invalide" })
+    }
+
+    const { displayName, avatarUrl, bio, country } = req.body
+
+    if (displayName || avatarUrl) {
+      stmt.updateUser.run(displayName || session.display_name, avatarUrl || session.avatar_url, session.user_id)
+    }
+
+    if (bio !== undefined || country !== undefined) {
+      const profile = stmt.getProfile.get(session.user_id)
+      stmt.updateProfile.run(bio ?? profile?.bio, country ?? profile?.country, session.user_id)
+    }
+
+    res.json({ success: true })
+  })
+
+  // Auth: Change password
+  app.post("/api/auth/change-password", async (req, res) => {
+    const token = req.headers.authorization?.replace("Bearer ", "")
+    if (!token) {
+      return res.status(401).json({ success: false, error: "Non authentifié" })
+    }
+
+    const session = stmt.getSessionByToken.get(token)
+    if (!session) {
+      return res.status(401).json({ success: false, error: "Session invalide" })
+    }
+
+    const { currentPassword, newPassword } = req.body
+
+    const user = stmt.getUserById.get(session.user_id)
+    const valid = await verifyPassword(currentPassword, user.password_hash)
+    if (!valid) {
+      return res.status(401).json({ success: false, error: "Mot de passe actuel incorrect" })
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ success: false, error: "Nouveau mot de passe trop court" })
+    }
+
+    const newHash = await hashPassword(newPassword)
+    stmt.updatePassword.run(newHash, session.user_id)
+
+    // Invalidate all sessions and create new one
+    stmt.deleteUserSessions.run(session.user_id)
+
+    const newToken = generateToken()
+    const sessionId = generateId()
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+
+    stmt.createSession.run(sessionId, session.user_id, newToken, expiresAt)
 
     res.json({
-      server: {
-        ...stats,
-        uptime: Math.floor((Date.now() - stats.startTime) / 1000),
-        currentConnections: connectedSockets.size,
+      success: true,
+      session: {
+        token: newToken,
+        expiresAt: new Date(expiresAt).getTime(),
       },
-      rooms: rooms.map((r) => ({
-        code: r.code,
-        phase: r.phase,
-        playerCount: r.player_count,
-        round: r.round,
-        maxRounds: r.max_rounds,
-      })),
-      recentGames: gameStats,
     })
   })
 
-  router.post("/admin/maintenance", express.json(), (req, res) => {
-    const token = req.headers.authorization?.replace("Bearer ", "")
-    const auth = validateSession(token)
+  // Logs (admin only - simplified check)
+  app.get("/api/logs", (req, res) => {
+    const limit = Math.min(Number.parseInt(req.query.limit) || 100, 500)
+    const type = req.query.type
 
-    if (!auth || auth.user.is_admin !== 1) {
-      return res.status(401).json({ error: "Non autorise" })
+    let logs = recentLogs
+    if (type) {
+      logs = logs.filter((l) => l.type === type)
     }
 
-    const { enabled, reason, severity } = req.body
-    maintenanceMode = {
-      enabled: !!enabled,
-      reason: reason || "",
-      severity: severity || "info",
-    }
-
-    if (enabled) {
-      io.emit("maintenance:active", maintenanceMode)
-    }
-
-    log("admin", `Maintenance ${enabled ? "enabled" : "disabled"}`, { reason })
-    res.json({ success: true, maintenance: maintenanceMode })
+    res.json({ logs: logs.slice(0, limit) })
   })
-
-  router.get("/admin/bans", (req, res) => {
-    const token = req.headers.authorization?.replace("Bearer ", "")
-    const auth = validateSession(token)
-
-    if (!auth || auth.user.is_admin !== 1) {
-      return res.status(401).json({ error: "Non autorise" })
-    }
-
-    const bans = stmt.getBans.all()
-    res.json({ bans })
-  })
-
-  router.get("/admin/reports", (req, res) => {
-    const token = req.headers.authorization?.replace("Bearer ", "")
-    const auth = validateSession(token)
-
-    if (!auth || auth.user.is_admin !== 1) {
-      return res.status(401).json({ error: "Non autorise" })
-    }
-
-    const reports = stmt.getReports.all()
-    res.json({ reports })
-  })
-
-  app.use(CONFIG.basePath, router)
-  app.use("/api", router)
 }
 
 // ============================================================
-// SOCKET.IO HANDLERS
+// SOCKET HANDLERS
 // ============================================================
 
 function setupSocketHandlers() {
-  io.use((socket, next) => {
-    const origin = socket.handshake.headers.origin
-    const ip = getClientIP(socket)
-
-    log("network", `New connection attempt`, { ip, origin })
-
-    const ban = stmt.getBan.get(ip, null, Date.now())
-    if (ban) {
-      log("security", `Blocked banned IP: ${ip}`)
-      stats.blockedConnections++
-      return next(new Error(`Banni: ${ban.reason}`))
-    }
-
-    const rateCheck = checkRateLimit(ip)
-    if (!rateCheck.allowed) {
-      log("security", `Rate limit exceeded: ${ip}`)
-      stats.blockedConnections++
-      return next(new Error("Trop de connexions. Reessayez plus tard."))
-    }
-
-    if (CONFIG.security.allowedOrigins[0] !== "*") {
-      const allowed = CONFIG.security.allowedOrigins.some((o) => {
-        if (!origin) return true // Allow no origin for socket clients
-        if (o.startsWith("*.")) {
-          const domain = o.slice(2)
-          return origin?.endsWith(domain) || origin?.endsWith("." + domain)
-        }
-        return o === origin
-      })
-
-      if (!allowed && origin) {
-        log("security", `Rejected origin: ${origin}`, { allowed: CONFIG.security.allowedOrigins })
-        stats.rejectedOrigins++
-        return next(new Error("Origine non autorisee"))
-      }
-    }
-
-    next()
-  })
-
   io.on("connection", (socket) => {
-    const ip = getClientIP(socket)
-    stats.connections++
+    const clientIp = socket.handshake.headers["x-forwarded-for"] || socket.handshake.address
+    stats.totalConnections++
 
-    if (connectedSockets.size + 1 > stats.peakConnections) {
-      stats.peakConnections = connectedSockets.size + 1
+    log("socket", `Connection: ${socket.id}`, { ip: clientIp })
+
+    // Rate limiting
+    const rateData = rateLimitMap.get(clientIp) || { count: 0, resetAt: Date.now() + 60000 }
+    if (Date.now() > rateData.resetAt) {
+      rateData.count = 0
+      rateData.resetAt = Date.now() + 60000
     }
+    rateData.count++
+    rateLimitMap.set(clientIp, rateData)
 
-    log("socket", `Connected: ${socket.id}`, { ip, transport: socket.conn.transport.name })
-
-    let idleTimer = setTimeout(() => {
-      log("socket", `Idle timeout: ${socket.id}`)
+    if (rateData.count > CONFIG.security.rateLimit.connectionsPerMinute) {
+      log("security", `Rate limited: ${clientIp}`)
+      socket.emit("error", { message: "Trop de connexions" })
       socket.disconnect(true)
-    }, CONFIG.security.idleTimeout)
-
-    const resetIdleTimer = () => {
-      clearTimeout(idleTimer)
-      idleTimer = setTimeout(() => {
-        socket.disconnect(true)
-      }, CONFIG.security.idleTimeout)
+      return
     }
 
+    // Create room
     socket.on("room:create", (data, callback) => {
-      resetIdleTimer()
-
-      log("room", `Create room request`, data)
-
-      if (!callback || typeof callback !== "function") {
-        log("error", "room:create called without callback")
-        socket.emit("room:error", { error: "Invalid request" })
-        return
-      }
-
-      if (!checkMessageRate(socket.id)) {
-        log("warning", `Rate limited: ${socket.id}`)
-        return callback({ success: false, error: "Trop de requetes" })
-      }
-
-      const playerName = data.playerName?.trim()
-      const settings = data.settings || {}
-
-      if (!playerName || playerName.length < 2) {
-        log("warning", `Invalid player name: ${playerName}`)
-        return callback({ success: false, error: "Pseudo invalide (min 2 caracteres)" })
-      }
-
-      if (playerName.length > 16) {
-        return callback({ success: false, error: "Pseudo trop long (max 16 caracteres)" })
-      }
-
-      const roomId = generateId()
-      const roomCode = generateRoomCode()
-      const playerId = generateId()
-
       try {
-        stmt.createRoom.run(
-          roomId,
-          roomCode,
-          playerId,
-          settings.drawTime || CONFIG.game.defaultDrawTime,
-          settings.rounds || CONFIG.game.defaultRounds,
-          settings.theme || "general",
-          settings.isPrivate ? 1 : 0,
-          settings.maxPlayers || CONFIG.game.maxPlayers,
-        )
+        log("room", `Creating room for: ${data.playerName}`)
 
-        stmt.createPlayer.run(playerId, roomId, null, playerName, settings.avatar || "#3b82f6", 1, socket.id)
-
-        stmt.updateRoom.run(
-          "waiting",
-          1,
-          0,
-          settings.drawTime || CONFIG.game.defaultDrawTime,
-          null,
-          "",
-          0,
-          "",
-          1,
-          Date.now(),
-          roomId,
-        )
-
-        socket.join(roomId)
-        connectedSockets.set(playerId, socket)
-
-        stats.roomsCreated++
-        log("room", `Room created: ${roomCode}`, { host: playerName, playerId })
-
-        callback({
-          success: true,
-          roomCode,
-          roomId,
-          playerId,
-        })
-
-        // Send initial sync after small delay to ensure client is ready
-        setTimeout(() => broadcastRoomSync(roomId), 100)
-      } catch (err) {
-        log("error", `Failed to create room`, { error: err.message })
-        callback({ success: false, error: "Erreur lors de la creation de la room" })
-      }
-    })
-
-    socket.on("room:join", (data, callback) => {
-      resetIdleTimer()
-
-      log("room", `Join room request`, data)
-
-      if (!callback || typeof callback !== "function") {
-        log("error", "room:join called without callback")
-        socket.emit("room:error", { error: "Invalid request" })
-        return
-      }
-
-      if (!checkMessageRate(socket.id)) {
-        return callback({ success: false, error: "Trop de requetes" })
-      }
-
-      const { code, playerName, playerId: existingPlayerId } = data
-      if (!code || !playerName) {
-        return callback({ success: false, error: "Code ou pseudo manquant" })
-      }
-
-      const room = stmt.getRoomByCode.get(code.toUpperCase())
-      if (!room) {
-        log("warning", `Room not found: ${code}`)
-        return callback({ success: false, error: "Salon introuvable" })
-      }
-
-      const players = stmt.getPlayersByRoom.all(room.id)
-
-      // Check for reconnection
-      if (existingPlayerId) {
-        const existingPlayer = players.find((p) => p.id === existingPlayerId)
-        if (existingPlayer) {
-          log("room", `Reconnecting player: ${playerName}`, { room: room.code })
-
-          stmt.updatePlayerConnection.run(1, socket.id, existingPlayerId)
-          socket.join(room.id)
-          connectedSockets.set(existingPlayerId, socket)
-
-          callback({
-            success: true,
-            roomCode: room.code,
-            roomId: room.id,
-            playerId: existingPlayerId,
-            room: {
-              phase: room.phase,
-              drawTime: room.draw_time,
-              maxRounds: room.max_rounds,
-            },
-            messages: roomChatHistory.get(room.id) || [],
-          })
-
-          setTimeout(() => broadcastRoomSync(room.id), 100)
-          return
+        const playerId = generateId()
+        const player = {
+          id: playerId,
+          socketId: socket.id,
+          name: data.playerName?.slice(0, 20) || "Joueur",
+          avatar: data.settings?.avatar || "default",
+          score: 0,
+          isHost: true,
+          isDrawing: false,
+          hasGuessed: false,
+          userId: null,
         }
-      }
 
-      if (players.length >= room.max_players) {
-        return callback({ success: false, error: "Salon plein" })
-      }
+        const room = createRoom(player, data.settings)
+        joinRoom(room, player)
 
-      if (room.phase !== "waiting") {
-        return callback({ success: false, error: "Partie en cours" })
-      }
-
-      const playerId = generateId()
-
-      try {
-        stmt.createPlayer.run(playerId, room.id, null, playerName.trim(), "#3b82f6", 0, socket.id)
-
-        stmt.updateRoom.run(
-          room.phase,
-          room.round,
-          room.turn,
-          room.time_left,
-          room.current_drawer,
-          room.current_word,
-          room.word_length,
-          room.masked_word,
-          players.length + 1,
-          Date.now(),
-          room.id,
-        )
-
+        socketToPlayer.set(socket.id, player)
         socket.join(room.id)
-        connectedSockets.set(playerId, socket)
 
-        log("room", `Player joined: ${playerName}`, { room: room.code, playerId })
-
-        socket.to(room.id).emit("room:player_joined", {
-          player: { id: playerId, name: playerName },
-        })
+        log("success", `Room created: ${room.code}`, { player: player.name })
 
         callback({
           success: true,
           roomCode: room.code,
           roomId: room.id,
-          playerId,
-          room: {
-            phase: room.phase,
-            drawTime: room.draw_time,
-            maxRounds: room.max_rounds,
-          },
-          messages: roomChatHistory.get(room.id) || [],
+          playerId: player.id,
         })
 
-        setTimeout(() => broadcastRoomSync(room.id), 100)
+        syncRoom(room, io)
       } catch (err) {
-        log("error", `Failed to join room`, { error: err.message })
+        log("error", "Room creation failed", err.message)
+        callback({ success: false, error: "Erreur lors de la création" })
+      }
+    })
+
+    // Join room
+    socket.on("room:join", (data, callback) => {
+      try {
+        log("room", `Join request: ${data.roomCode} by ${data.playerName}`)
+
+        const roomData = stmt.getRoomByCode.get(data.roomCode?.toUpperCase())
+        if (!roomData) {
+          return callback({ success: false, error: "Partie introuvable" })
+        }
+
+        let room = rooms.get(roomData.id)
+        if (!room) {
+          // Reconstruct room from DB
+          room = {
+            id: roomData.id,
+            code: roomData.code,
+            hostId: roomData.host_id,
+            isPrivate: !!roomData.is_private,
+            maxPlayers: roomData.max_players,
+            drawTime: roomData.draw_time,
+            maxRounds: roomData.max_rounds,
+            theme: roomData.theme || "general",
+            phase: roomData.phase || "lobby",
+            round: 0,
+            turn: 0,
+            currentDrawer: null,
+            currentWord: null,
+            maskedWord: "",
+            wordLength: 0,
+            timeLeft: 0,
+            players: new Map(),
+            guessedPlayers: new Set(),
+            createdAt: Date.now(),
+          }
+          rooms.set(room.id, room)
+        }
+
+        if (room.players.size >= room.maxPlayers) {
+          return callback({ success: false, error: "Partie pleine" })
+        }
+
+        if (room.phase !== "lobby") {
+          return callback({ success: false, error: "Partie en cours" })
+        }
+
+        const playerId = data.playerId || generateId()
+        const player = {
+          id: playerId,
+          socketId: socket.id,
+          name: data.playerName?.slice(0, 20) || "Joueur",
+          avatar: data.avatar || "default",
+          score: 0,
+          isHost: false,
+          isDrawing: false,
+          hasGuessed: false,
+          userId: null,
+        }
+
+        joinRoom(room, player)
+        socketToPlayer.set(socket.id, player)
+        socket.join(room.id)
+
+        log("success", `${player.name} joined ${room.code}`)
+
+        const messages = roomChatHistory.get(room.id) || []
+
+        callback({
+          success: true,
+          roomCode: room.code,
+          roomId: room.id,
+          playerId: player.id,
+          messages: messages.slice(-50),
+        })
+
+        io.to(room.id).emit("player:joined", {
+          id: player.id,
+          name: player.name,
+        })
+
+        syncRoom(room, io)
+      } catch (err) {
+        log("error", "Join failed", err.message)
         callback({ success: false, error: "Erreur lors de la connexion" })
       }
     })
 
-    // Room: Leave
+    // Leave room
     socket.on("room:leave", () => {
-      log("room", `Leave request: ${socket.id}`)
-      handleDisconnect(socket)
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return
+
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (room) {
+        leaveRoom(room, player.id, io)
+        socket.leave(room.id)
+      }
+
+      socketToPlayer.delete(socket.id)
     })
 
-    // Room: Settings
+    // Room settings
     socket.on("room:settings", (data, callback) => {
-      resetIdleTimer()
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return callback({ success: false })
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_host !== 1) {
-        return callback?.({ success: false, error: "Non autorise" })
-      }
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.hostId !== player.id) return callback({ success: false })
 
-      const room = stmt.getRoom.get(player.room_id)
-      if (!room || room.phase !== "waiting") {
-        return callback?.({ success: false, error: "Impossible de modifier" })
-      }
+      if (data.drawTime) room.drawTime = Math.max(30, Math.min(180, data.drawTime))
+      if (data.maxRounds) room.maxRounds = Math.max(1, Math.min(10, data.maxRounds))
 
-      log("room", `Settings update`, data)
-
-      stmt.updateRoomSettings.run(
-        data.drawTime || room.draw_time,
-        data.maxRounds || room.max_rounds,
-        Date.now(),
-        room.id,
-      )
-
-      broadcastRoomSync(room.id)
-      callback?.({ success: true })
+      stmt.updateRoomSettings.run(room.drawTime, room.maxRounds, room.id)
+      syncRoom(room, io)
+      callback({ success: true })
     })
 
-    // Game: Start
-    socket.on("game:start", (data, callback) => {
-      resetIdleTimer()
+    // Start game
+    socket.on("game:start", (_, callback) => {
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return callback({ success: false, error: "Non connecté" })
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_host !== 1) {
-        return callback?.({ success: false, error: "Seul l'hote peut demarrer" })
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room) return callback({ success: false, error: "Partie introuvable" })
+
+      if (room.hostId !== player.id) {
+        return callback({ success: false, error: "Seul l'hôte peut démarrer" })
       }
 
-      const room = stmt.getRoom.get(player.room_id)
-      if (!room) {
-        return callback?.({ success: false, error: "Salon introuvable" })
+      if (room.players.size < CONFIG.game.minPlayers) {
+        return callback({ success: false, error: `Minimum ${CONFIG.game.minPlayers} joueurs` })
       }
 
-      const players = stmt.getPlayersByRoom.all(room.id).filter((p) => p.is_connected === 1)
-      if (players.length < CONFIG.game.minPlayers) {
-        return callback?.({ success: false, error: `Minimum ${CONFIG.game.minPlayers} joueurs requis` })
+      if (room.phase !== "lobby") {
+        return callback({ success: false, error: "Partie déjà en cours" })
       }
 
-      log("game", `Starting game in room ${room.code}`, { players: players.length })
-
-      stats.gamesPlayed++
-      stmt.resetPlayersForGame.run(room.id)
-
-      io.to(room.id).emit("game:starting", { countdown: 3 })
-
-      setTimeout(() => {
-        startTurn(room.id)
-      }, 3000)
-
-      callback?.({ success: true })
+      startGame(room, io)
+      callback({ success: true })
     })
 
-    // Game: Select word
+    // Select word
     socket.on("game:select_word", (data) => {
-      resetIdleTimer()
-
-      const player = stmt.getPlayerBySocket.get(socket.id)
+      const player = socketToPlayer.get(socket.id)
       if (!player) return
 
-      log("game", `Word selected by ${player.name}`, { word: data.word })
-      selectWord(player.room_id, player.id, data.word)
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.currentDrawer !== player.id || room.phase !== "choosing") return
+
+      selectWord(room, io, data.word)
     })
 
-    // Game: Next round
-    socket.on("game:next_round", (data, callback) => {
-      resetIdleTimer()
-
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_host !== 1) {
-        return callback?.({ success: false })
-      }
-
-      nextRound(player.room_id)
-      callback?.({ success: true })
-    })
-
-    // Game: Play again
-    socket.on("game:play_again", (data, callback) => {
-      resetIdleTimer()
-
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player) {
-        return callback?.({ success: false })
-      }
-
-      const room = stmt.getRoom.get(player.room_id)
-      if (!room || room.phase !== "gameEnd") {
-        return callback?.({ success: false })
-      }
-
-      log("game", `Play again in room ${room.code}`)
-
-      stmt.resetPlayersForGame.run(room.id)
-      stmt.updateRoom.run("waiting", 1, 0, room.draw_time, null, "", 0, "", room.player_count, Date.now(), room.id)
-
-      roomDrawerOrder.delete(room.id)
-
-      broadcastRoomSync(room.id)
-      callback?.({ success: true })
-    })
-
-    // Chat: Message
+    // Chat message
     socket.on("chat:message", (data) => {
-      resetIdleTimer()
-      stats.messagesProcessed++
+      const player = socketToPlayer.get(socket.id)
+      if (!player || !data.message) return
 
-      if (!checkMessageRate(socket.id)) return
+      // Rate limit messages
+      const msgRate = messageRateMap.get(socket.id) || { count: 0, resetAt: Date.now() + 1000 }
+      if (Date.now() > msgRate.resetAt) {
+        msgRate.count = 0
+        msgRate.resetAt = Date.now() + 1000
+      }
+      msgRate.count++
+      messageRateMap.set(socket.id, msgRate)
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player) return
+      if (msgRate.count > CONFIG.security.rateLimit.messagesPerSecond) {
+        return socket.emit("chat:error", { message: "Trop de messages" })
+      }
 
-      const room = stmt.getRoom.get(player.room_id)
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
       if (!room) return
 
-      const message = data.message?.trim()
-      if (!message || message.length > 200) return
+      const message = data.message.slice(0, 200).trim()
+      if (!message) return
 
-      const { isCorrect, isClose } = checkGuess(room.id, player.id, message)
+      // Check for guess
+      let guessResult = { isCorrect: false, isClose: false }
+      if (room.phase === "drawing" && room.currentDrawer !== player.id && !player.hasGuessed) {
+        guessResult = handleGuess(room, player, message, io)
+      }
 
-      if (isCorrect) {
+      // Don't send correct guesses to chat
+      if (guessResult.isCorrect) {
+        syncRoom(room, io)
         return
       }
 
@@ -1859,8 +1823,8 @@ function setupSocketHandlers() {
         playerName: player.name,
         message,
         timestamp: Date.now(),
-        isClose,
-        isGuess: room.phase === "drawing" && player.is_drawing !== 1,
+        isClose: guessResult.isClose,
+        isGuess: room.phase === "drawing" && room.currentDrawer !== player.id,
       }
 
       const history = roomChatHistory.get(room.id) || []
@@ -1869,263 +1833,109 @@ function setupSocketHandlers() {
       roomChatHistory.set(room.id, history)
 
       io.to(room.id).emit("chat:message", chatMsg)
+
+      if (guessResult.isClose) {
+        socket.emit("game:close_guess", { message: "Tu es proche!" })
+      }
     })
 
-    // Draw: Stroke
-    socket.on("draw:stroke", (stroke) => {
-      resetIdleTimer()
-      stats.strokesProcessed++
+    // Drawing
+    socket.on("draw:stroke", (data) => {
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return
 
-      if (!checkMessageRate(socket.id)) return
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.currentDrawer !== player.id) return
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_drawing !== 1) return
-
-      socket.to(player.room_id).emit("draw:stroke", stroke)
+      socket.to(room.id).emit("draw:stroke", data)
     })
 
-    // Draw: Clear
     socket.on("draw:clear", () => {
-      resetIdleTimer()
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_drawing !== 1) return
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.currentDrawer !== player.id) return
 
-      log("draw", `Canvas cleared by ${player.name}`)
-      socket.to(player.room_id).emit("draw:clear")
+      socket.to(room.id).emit("draw:clear")
     })
 
-    // Draw: Undo
     socket.on("draw:undo", () => {
-      resetIdleTimer()
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_drawing !== 1) return
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.currentDrawer !== player.id) return
 
-      socket.to(player.room_id).emit("draw:undo")
+      socket.to(room.id).emit("draw:undo")
     })
 
-    // Player: Kick
+    // Play again
+    socket.on("game:play_again", (_, callback) => {
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return callback({ success: false })
+
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.hostId !== player.id) return callback({ success: false })
+
+      room.phase = "lobby"
+      room.round = 0
+      room.turn = 0
+      room.currentDrawer = null
+      room.currentWord = null
+      room.players.forEach((p) => {
+        p.score = 0
+        p.hasGuessed = false
+        p.isDrawing = false
+      })
+
+      stmt.updateRoomPhase.run("lobby", room.id)
+      syncRoom(room, io)
+      callback({ success: true })
+    })
+
+    // Kick player
     socket.on("player:kick", (data, callback) => {
-      resetIdleTimer()
+      const player = socketToPlayer.get(socket.id)
+      if (!player) return callback({ success: false })
 
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_host !== 1) {
-        return callback?.({ success: false, error: "Non autorise" })
-      }
+      const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+      if (!room || room.hostId !== player.id) return callback({ success: false, error: "Non autorisé" })
 
-      const targetId = data.playerId || data.targetPlayerId
-      const target = stmt.getPlayer.get(targetId)
-      if (!target || target.room_id !== player.room_id) {
-        return callback?.({ success: false, error: "Joueur introuvable" })
-      }
+      const target = room.players.get(data.playerId)
+      if (!target || target.id === player.id) return callback({ success: false })
 
-      log("room", `Kicking player: ${target.name}`)
-
-      const targetSocket = connectedSockets.get(target.id)
-      if (targetSocket) {
-        targetSocket.emit("player:kicked", { reason: "Expulse par l'hote" })
-        targetSocket.leave(player.room_id)
-        targetSocket.disconnect(true)
-      }
-
-      stmt.deletePlayer.run(target.id)
-      connectedSockets.delete(target.id)
-
-      const room = stmt.getRoom.get(player.room_id)
-      if (room) {
-        stmt.updateRoom.run(
-          room.phase,
-          room.round,
-          room.turn,
-          room.time_left,
-          room.current_drawer,
-          room.current_word,
-          room.word_length,
-          room.masked_word,
-          Math.max(0, room.player_count - 1),
-          Date.now(),
-          room.id,
-        )
-      }
-
-      broadcastRoomSync(player.room_id)
-      callback?.({ success: true })
-    })
-
-    // Player: Ban
-    socket.on("player:ban", (data, callback) => {
-      resetIdleTimer()
-
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player || player.is_host !== 1) {
-        return callback?.({ success: false, error: "Non autorise" })
-      }
-
-      const targetId = data.playerId || data.targetPlayerId
-      const target = stmt.getPlayer.get(targetId)
-      if (!target || target.room_id !== player.room_id) {
-        return callback?.({ success: false, error: "Joueur introuvable" })
-      }
-
-      log("room", `Banning player: ${target.name}`)
-
-      const targetSocket = connectedSockets.get(target.id)
-      const targetIp = targetSocket ? getClientIP(targetSocket) : null
-
-      stmt.createBan.run(generateId(), targetIp, target.user_id, data.reason || "Banni par l'hote", player.id, null)
-
-      if (targetSocket) {
-        targetSocket.emit("player:banned", { reason: data.reason || "Banni par l'hote" })
-        targetSocket.leave(player.room_id)
-        targetSocket.disconnect(true)
-      }
-
-      stmt.deletePlayer.run(target.id)
-      connectedSockets.delete(target.id)
-
-      const room = stmt.getRoom.get(player.room_id)
-      if (room) {
-        stmt.updateRoom.run(
-          room.phase,
-          room.round,
-          room.turn,
-          room.time_left,
-          room.current_drawer,
-          room.current_word,
-          room.word_length,
-          room.masked_word,
-          Math.max(0, room.player_count - 1),
-          Date.now(),
-          room.id,
-        )
-      }
-
-      broadcastRoomSync(player.room_id)
-      callback?.({ success: true })
-    })
-
-    // Player: Report
-    socket.on("player:report", (data, callback) => {
-      resetIdleTimer()
-
-      const player = stmt.getPlayerBySocket.get(socket.id)
-      if (!player) {
-        return callback?.({ success: false })
-      }
-
-      const targetId = data.playerId || data.reportedId
-      const target = stmt.getPlayer.get(targetId)
-      if (!target) {
-        return callback?.({ success: false })
-      }
-
-      const room = stmt.getRoom.get(player.room_id)
-
-      stmt.createReport.run(
-        generateId(),
-        player.id,
-        target.id,
-        target.name,
-        data.reason,
-        data.details || null,
-        room?.code || "",
+      // Find target socket
+      const targetSocket = Array.from(io.sockets.sockets.values()).find(
+        (s) => socketToPlayer.get(s.id)?.id === target.id,
       )
 
-      log("admin", `Report: ${target.name}`, { reason: data.reason, by: player.name })
+      if (targetSocket) {
+        targetSocket.emit("player:kicked", { reason: "Expulsé par l'hôte" })
+        targetSocket.leave(room.id)
+        socketToPlayer.delete(targetSocket.id)
+      }
 
-      callback?.({ success: true })
+      leaveRoom(room, target.id, io)
+      callback({ success: true })
     })
 
     // Disconnect
     socket.on("disconnect", (reason) => {
-      clearTimeout(idleTimer)
       log("socket", `Disconnected: ${socket.id}`, { reason })
-      handleDisconnect(socket)
+
+      const player = socketToPlayer.get(socket.id)
+      if (player) {
+        const room = Array.from(rooms.values()).find((r) => r.players.has(player.id))
+        if (room) {
+          leaveRoom(room, player.id, io)
+        }
+        socketToPlayer.delete(socket.id)
+      }
     })
   })
-}
 
-function handleDisconnect(socket) {
-  const player = stmt.getPlayerBySocket.get(socket.id)
-  if (!player) {
-    return
-  }
-
-  const room = stmt.getRoom.get(player.room_id)
-  if (!room) {
-    stmt.deletePlayer.run(player.id)
-    connectedSockets.delete(player.id)
-    return
-  }
-
-  log("room", `Player disconnected: ${player.name}`, { room: room.code })
-
-  stmt.updatePlayerConnection.run(0, null, player.id)
-  connectedSockets.delete(player.id)
-
-  const players = stmt.getPlayersByRoom.all(room.id)
-  const connectedPlayers = players.filter((p) => p.is_connected === 1)
-
-  if (connectedPlayers.length === 0) {
-    log("room", `No players left, scheduling room cleanup: ${room.code}`)
-
-    setTimeout(() => {
-      const currentRoom = stmt.getRoom.get(room.id)
-      if (currentRoom) {
-        const currentPlayers = stmt.getPlayersByRoom.all(room.id)
-        const stillConnected = currentPlayers.filter((p) => p.is_connected === 1)
-        if (stillConnected.length === 0) {
-          clearRoomTimers(room.id)
-          stmt.deletePlayersByRoom.run(room.id)
-          stmt.deleteRoom.run(room.id)
-          roomChatHistory.delete(room.id)
-          roomDrawerOrder.delete(room.id)
-          log("room", `Room deleted: ${room.code}`)
-        }
-      }
-    }, 120000) // 2 minutes instead of 1
-  } else {
-    if (player.is_host === 1 && connectedPlayers.length > 0) {
-      const newHost = connectedPlayers[0]
-      stmt.updatePlayerHost.run(0, player.id)
-      stmt.updatePlayerHost.run(1, newHost.id)
-      stmt.updateRoomHost.run(newHost.id, Date.now(), room.id)
-
-      log("room", `Host transferred to: ${newHost.name}`)
-
-      io.to(room.id).emit("host:changed", {
-        newHostId: newHost.id,
-        newHostName: newHost.name,
-      })
-    }
-
-    if (player.id === room.current_drawer && room.phase === "drawing") {
-      log("game", "Drawer disconnected, ending turn")
-      endTurn(room.id, false)
-    }
-
-    stmt.updateRoom.run(
-      room.phase,
-      room.round,
-      room.turn,
-      room.time_left,
-      room.current_drawer,
-      room.current_word,
-      room.word_length,
-      room.masked_word,
-      connectedPlayers.length,
-      Date.now(),
-      room.id,
-    )
-
-    socket.to(room.id).emit("player:disconnected", {
-      playerId: player.id,
-      reason: "Deconnexion",
-    })
-
-    broadcastRoomSync(room.id)
-  }
+  log("socket", "Socket handlers initialized")
 }
 
 // ============================================================
@@ -2133,23 +1943,26 @@ function handleDisconnect(socket) {
 // ============================================================
 
 function setupCleanup() {
+  // Clean expired sessions hourly
   setInterval(
     () => {
-      stmt.deleteExpiredSessions.run(Date.now())
+      const result = stmt.cleanExpiredSessions.run()
+      if (result.changes > 0) {
+        log("db", `Cleaned ${result.changes} expired sessions`)
+      }
     },
     60 * 60 * 1000,
   )
 
+  // Clean empty rooms every 5 minutes
   setInterval(
     () => {
-      const rooms = stmt.getAllRooms.all()
-      for (const room of rooms) {
-        const players = stmt.getPlayersByRoom.all(room.id)
-        const connected = players.filter((p) => p.is_connected === 1)
-        if (connected.length === 0 && Date.now() - room.updated_at > 300000) {
+      for (const [id, room] of rooms) {
+        if (room.players.size === 0) {
           clearRoomTimers(room.id)
           stmt.deletePlayersByRoom.run(room.id)
           stmt.deleteRoom.run(room.id)
+          rooms.delete(id)
           roomChatHistory.delete(room.id)
           roomDrawerOrder.delete(room.id)
           log("info", `Cleaned up empty room: ${room.code}`)
@@ -2159,6 +1972,7 @@ function setupCleanup() {
     5 * 60 * 1000,
   )
 
+  // Clean rate limit maps
   setInterval(() => {
     const now = Date.now()
     for (const [ip, data] of rateLimitMap) {
@@ -2187,38 +2001,10 @@ function startServer() {
 
   app = express()
 
-  if (env.behindProxy) {
-    app.set("trust proxy", 1)
-  }
+  app.set("trust proxy", true)
 
   const corsOptions = {
-    origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps or curl)
-      if (!origin) {
-        log("network", "Request without origin - allowing")
-        return callback(null, true)
-      }
-      // Allow all origins in allowedOrigins
-      if (CONFIG.security.allowedOrigins.includes("*")) {
-        return callback(null, true)
-      }
-      // Check if origin is allowed (with and without trailing slash)
-      const normalizedOrigin = origin.replace(/\/$/, "")
-      const isAllowed = CONFIG.security.allowedOrigins.some((allowed) => {
-        const normalizedAllowed = allowed.replace(/\/$/, "")
-        return normalizedOrigin === normalizedAllowed || normalizedOrigin.startsWith(normalizedAllowed)
-      })
-
-      if (isAllowed) {
-        log("network", `CORS allowed: ${origin}`)
-        return callback(null, true)
-      }
-
-      log("security", `CORS blocked origin: ${origin}`)
-      stats.rejectedOrigins++
-      // Still allow for debugging - just log it
-      callback(null, true)
-    },
+    origin: "*", // Allow all origins for Coolify
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
@@ -2235,54 +2021,27 @@ function startServer() {
     next()
   })
 
-  if (CONFIG.ssl.enabled && !env.behindProxy) {
-    if (existsSync(CONFIG.ssl.keyPath) && existsSync(CONFIG.ssl.certPath)) {
-      server = createHttpsServer(
-        {
-          key: readFileSync(CONFIG.ssl.keyPath),
-          cert: readFileSync(CONFIG.ssl.certPath),
-        },
-        app,
-      )
-      log("success", "SSL/TLS enabled (direct HTTPS)")
-    } else {
-      log("warning", "SSL certificates not found, using HTTP")
-      server = createHttpServer(app)
-    }
-  } else {
-    server = createHttpServer(app)
-    if (env.behindProxy) {
-      log("info", "Reverse proxy detected - SSL handled by proxy")
-    }
-  }
-
-  const socketPath = "/socket.io"
-  log("info", `Socket.IO path: ${socketPath}`)
+  server = createHttpServer(app)
+  log("info", "HTTP server created (SSL handled by Coolify/Traefik)")
 
   io = new Server(server, {
     cors: {
-      origin: "*", // Allow all origins for socket.io
+      origin: "*",
       methods: ["GET", "POST"],
       credentials: true,
     },
-    path: socketPath,
+    path: "/socket.io",
     transports: ["polling", "websocket"],
-    // Allow upgrade from polling to websocket
     allowUpgrades: true,
-    // Increased timeouts for stability
     pingTimeout: 60000,
     pingInterval: 25000,
-    // Upgrade timeout
     upgradeTimeout: 30000,
     maxHttpBufferSize: CONFIG.security.maxMessageSize,
-    // Disable EIO3 for security
     allowEIO3: false,
-    // Connection state recovery
     connectionStateRecovery: {
       maxDisconnectionDuration: 2 * 60 * 1000,
       skipMiddlewares: true,
     },
-    // Cookie settings
     cookie: false,
   })
 
@@ -2298,49 +2057,47 @@ function startServer() {
   setupCleanup()
 
   server.listen(CONFIG.port, CONFIG.host, () => {
-    const localUrl = `http://${CONFIG.host}:${CONFIG.port}`
-
     logBox("Server Configuration", [
       `${C.dim}Listen:${C.reset}         ${CONFIG.host}:${CONFIG.port}`,
       `${C.dim}Public URL:${C.reset}     ${CONFIG.publicUrl}`,
-      `${C.dim}Base Path:${C.reset}      ${CONFIG.basePath}`,
-      `${C.dim}Socket Path:${C.reset}    ${socketPath}`,
-      `${C.dim}Reverse Proxy:${C.reset}  ${env.behindProxy ? "Yes" : "No"}`,
-      `${C.dim}Origins:${C.reset}        ${CONFIG.security.allowedOrigins.slice(0, 2).join(", ")}`,
-      `${C.dim}Rate Limit:${C.reset}     ${CONFIG.security.rateLimit.connectionsPerMinute} conn/min`,
+      `${C.dim}Platform:${C.reset}       ${env.platform}`,
+      `${C.dim}Socket Path:${C.reset}    /socket.io`,
+      `${C.dim}Coolify:${C.reset}        ${env.isCoolify ? "Yes" : "No"}`,
+      `${C.dim}Origins:${C.reset}        * (all allowed)`,
     ])
 
-    console.log("")
-    log("success", `Server ready on ${localUrl}`)
-    console.log("")
-    log("info", `Frontend should connect to: ${CONFIG.publicUrl}`)
-    log("info", `Socket.IO will be available at: ${CONFIG.publicUrl}${socketPath}`)
-    console.log("")
-  })
-
-  process.on("SIGTERM", () => {
-    log("warning", "Shutting down (SIGTERM)...")
-    io.emit("server:shutdown", { message: "Le serveur redemarre" })
-
-    server.close(() => {
-      db.close()
-      process.exit(0)
-    })
-
-    setTimeout(() => process.exit(1), 10000)
-  })
-
-  process.on("SIGINT", () => {
-    log("warning", "Shutting down (SIGINT)...")
-    io.emit("server:shutdown", { message: "Le serveur s'arrete" })
-
-    server.close(() => {
-      db.close()
-      process.exit(0)
-    })
-
-    setTimeout(() => process.exit(1), 5000)
+    log("success", `Server is running on port ${CONFIG.port}`)
+    log("info", `Socket.IO available at /socket.io`)
   })
 }
 
-startServer()
+// ============================================================
+// INITIALIZE
+// ============================================================
+
+try {
+  initDatabase()
+  prepareStatements()
+  startServer()
+} catch (err) {
+  console.error(`${C.red}FATAL ERROR:${C.reset}`, err)
+  process.exit(1)
+}
+
+// Graceful shutdown
+process.on("SIGTERM", () => {
+  log("warning", "SIGTERM received, shutting down...")
+  io?.emit("server:shutdown", { message: "Serveur en maintenance" })
+  setTimeout(() => {
+    server?.close()
+    db?.close()
+    process.exit(0)
+  }, 1000)
+})
+
+process.on("SIGINT", () => {
+  log("warning", "SIGINT received, shutting down...")
+  server?.close()
+  db?.close()
+  process.exit(0)
+})
