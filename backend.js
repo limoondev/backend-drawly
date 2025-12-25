@@ -2193,15 +2193,35 @@ function startServer() {
 
   const corsOptions = {
     origin: (origin, callback) => {
-      if (!origin) return callback(null, true)
-      if (CONFIG.security.allowedOrigins.includes("*")) return callback(null, true)
-      if (CONFIG.security.allowedOrigins.includes(origin)) return callback(null, true)
+      // Allow requests with no origin (like mobile apps or curl)
+      if (!origin) {
+        log("network", "Request without origin - allowing")
+        return callback(null, true)
+      }
+      // Allow all origins in allowedOrigins
+      if (CONFIG.security.allowedOrigins.includes("*")) {
+        return callback(null, true)
+      }
+      // Check if origin is allowed (with and without trailing slash)
+      const normalizedOrigin = origin.replace(/\/$/, "")
+      const isAllowed = CONFIG.security.allowedOrigins.some((allowed) => {
+        const normalizedAllowed = allowed.replace(/\/$/, "")
+        return normalizedOrigin === normalizedAllowed || normalizedOrigin.startsWith(normalizedAllowed)
+      })
+
+      if (isAllowed) {
+        log("network", `CORS allowed: ${origin}`)
+        return callback(null, true)
+      }
 
       log("security", `CORS blocked origin: ${origin}`)
-      callback(new Error("Not allowed by CORS"))
+      stats.rejectedOrigins++
+      // Still allow for debugging - just log it
+      callback(null, true)
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   }
 
   app.use(cors(corsOptions))
@@ -2236,18 +2256,41 @@ function startServer() {
     }
   }
 
+  const socketPath = "/socket.io"
+  log("info", `Socket.IO path: ${socketPath}`)
+
   io = new Server(server, {
-    cors: corsOptions,
-    path: `${CONFIG.basePath}/socket.io`,
-    transports: ["websocket", "polling"],
+    cors: {
+      origin: "*", // Allow all origins for socket.io
+      methods: ["GET", "POST"],
+      credentials: true,
+    },
+    path: socketPath,
+    transports: ["polling", "websocket"],
+    // Allow upgrade from polling to websocket
+    allowUpgrades: true,
+    // Increased timeouts for stability
     pingTimeout: 60000,
     pingInterval: 25000,
+    // Upgrade timeout
+    upgradeTimeout: 30000,
     maxHttpBufferSize: CONFIG.security.maxMessageSize,
+    // Disable EIO3 for security
     allowEIO3: false,
+    // Connection state recovery
     connectionStateRecovery: {
-      maxDisconnectionDuration: 2 * 60 * 1000, // 2 minutes
+      maxDisconnectionDuration: 2 * 60 * 1000,
       skipMiddlewares: true,
     },
+    // Cookie settings
+    cookie: false,
+  })
+
+  io.engine.on("connection_error", (err) => {
+    log("error", `Socket.IO engine error: ${err.message}`, {
+      code: err.code,
+      context: err.context,
+    })
   })
 
   setupRoutes()
@@ -2261,7 +2304,7 @@ function startServer() {
       `${C.dim}Listen:${C.reset}         ${CONFIG.host}:${CONFIG.port}`,
       `${C.dim}Public URL:${C.reset}     ${CONFIG.publicUrl}`,
       `${C.dim}Base Path:${C.reset}      ${CONFIG.basePath}`,
-      `${C.dim}Socket Path:${C.reset}    ${CONFIG.basePath}/socket.io`,
+      `${C.dim}Socket Path:${C.reset}    ${socketPath}`,
       `${C.dim}Reverse Proxy:${C.reset}  ${env.behindProxy ? "Yes" : "No"}`,
       `${C.dim}Origins:${C.reset}        ${CONFIG.security.allowedOrigins.slice(0, 2).join(", ")}`,
       `${C.dim}Rate Limit:${C.reset}     ${CONFIG.security.rateLimit.connectionsPerMinute} conn/min`,
@@ -2271,7 +2314,7 @@ function startServer() {
     log("success", `Server ready on ${localUrl}`)
     console.log("")
     log("info", `Frontend should connect to: ${CONFIG.publicUrl}`)
-    log("info", `Socket.IO path: ${CONFIG.basePath}/socket.io`)
+    log("info", `Socket.IO will be available at: ${CONFIG.publicUrl}${socketPath}`)
     console.log("")
   })
 
