@@ -1258,22 +1258,30 @@ function shuffleArray(array) {
 let app, server, io
 
 function setupRoutes() {
-  app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*")
-    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-    res.header(
-      "Access-Control-Allow-Headers",
-      "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Admin-Key",
-    )
-    res.header("Access-Control-Allow-Credentials", "true")
-
-    if (req.method === "OPTIONS") {
-      return res.status(200).end()
-    }
-    next()
+  app.get("/socket.io/", (req, res) => {
+    // This should NOT be reached if Socket.IO is working correctly
+    // Socket.IO handles /socket.io/ requests itself
+    res.json({
+      error: "Socket.IO not initialized correctly",
+      hint: "This route should be handled by Socket.IO, not Express",
+      socketPath: "/socket.io",
+      timestamp: new Date().toISOString(),
+    })
   })
 
-  const getStatusResponse = () => {
+  app.get("/socket-debug", (req, res) => {
+    res.json({
+      status: "ok",
+      message: "Backend is receiving requests",
+      socketIO: io ? "initialized" : "not initialized",
+      connections: io ? io.engine?.clientsCount || 0 : 0,
+      path: "/socket.io",
+      timestamp: new Date().toISOString(),
+    })
+  })
+
+  // Status endpoints (multiple paths for compatibility)
+  const statusHandler = (req, res) => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     return {
       name: CONFIG.server.name,
@@ -1293,24 +1301,13 @@ function setupRoutes() {
     }
   }
 
-  app.get("/", (req, res) => res.json(getStatusResponse()))
-  app.get("/status", (req, res) => res.json(getStatusResponse()))
-  app.get("/health", (req, res) => res.json(getStatusResponse()))
-  app.get("/info", (req, res) =>
-    res.json({ ...getStatusResponse(), features: ["rooms", "auth", "chat", "drawing", "word-selection"] }),
-  )
-  app.get("/api/status", (req, res) => res.json(getStatusResponse()))
-  app.get("/api/info", (req, res) =>
-    res.json({ ...getStatusResponse(), features: ["rooms", "auth", "chat", "drawing", "word-selection"] }),
-  )
-  app.get("/api/health", (req, res) => res.json(getStatusResponse()))
-
-  app.get("/socket.io/", (req, res) => {
-    res.json({
-      status: "Socket.IO endpoint",
-      hint: "This endpoint handles Socket.IO connections",
-    })
-  })
+  app.get("/", statusHandler)
+  app.get("/status", statusHandler)
+  app.get("/health", statusHandler)
+  app.get("/info", statusHandler)
+  app.get("/api/status", statusHandler)
+  app.get("/api/info", statusHandler)
+  app.get("/api/health", statusHandler)
 
   // Stats endpoint
   app.get("/api/stats", (req, res) => {
@@ -1996,8 +1993,8 @@ function setupCleanup() {
           stmt.deletePlayersByRoom.run(room.id)
           stmt.deleteRoom.run(room.id)
           rooms.delete(id)
-          roomChatHistory.delete(room.id)
-          roomDrawerOrder.delete(room.id)
+          roomChatHistory.delete(id)
+          roomDrawerOrder.delete(id)
           log("info", `Cleaned up empty room: ${room.code}`)
         }
       }
