@@ -1,0 +1,26 @@
+{
+  "name": "drawly-backend",
+  "version": "1.0.0",
+  "description": "Application Express avec Socket.IO et SQLite",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node backend.js",
+    "dev": "nodemon backend.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^8.2.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
