@@ -14,6 +14,11 @@ import { existsSync, mkdirSync } from "fs"
 import path from "path"
 import crypto from "crypto"
 
+// Declare app, server, and io variables to fix undeclared variable errors
+let app
+let server
+let io
+
 // ============================================================
 // AUTO-DETECTION & CONFIGURATION
 // ============================================================
@@ -1255,62 +1260,32 @@ function shuffleArray(array) {
 // EXPRESS ROUTES
 // ============================================================
 
-let app, server, io
+// ============================================================
+// ROUTES - All routes are relative to where Coolify proxies
+// Coolify proxies /drawly/api/* -> backend:PORT/*
+// So /drawly/api/status -> backend/status (we define /status)
+// ============================================================
 
 function setupRoutes() {
-  app.get("/socket.io/", (req, res) => {
-    // This should NOT be reached if Socket.IO is working correctly
-    // Socket.IO handles /socket.io/ requests itself
-    res.json({
-      error: "Socket.IO not initialized correctly",
-      hint: "This route should be handled by Socket.IO, not Express",
-      socketPath: "/socket.io",
-      timestamp: new Date().toISOString(),
-    })
-  })
-
-  app.get("/socket-debug", (req, res) => {
-    res.json({
-      status: "ok",
-      message: "Backend is receiving requests",
-      socketIO: io ? "initialized" : "not initialized",
-      connections: io ? io.engine?.clientsCount || 0 : 0,
-      path: "/socket.io",
-      timestamp: new Date().toISOString(),
-    })
-  })
-
-  // Status endpoints (multiple paths for compatibility)
   const statusHandler = (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     res.json({
-      name: CONFIG.server.name,
-      version: CONFIG.server.version,
       status: "online",
-      players: socketToPlayer.size,
-      rooms: rooms.size,
+      server: "Drawly Backend",
+      version: "2.0.0",
+      timestamp: Date.now(),
+      uptime: Math.floor((Date.now() - stats.startTime) / 1000),
       connections: socketToPlayer.size,
-      uptime,
-      stats: {
-        connections: socketToPlayer.size,
-        players: socketToPlayer.size,
-        rooms: rooms.size,
-        activeRooms: rooms.size,
-        uptime,
-      },
+      rooms: rooms.size,
     })
   }
 
+  // Status routes (accessible via /drawly/api/status, /drawly/api/health, etc.)
   app.get("/", statusHandler)
   app.get("/status", statusHandler)
   app.get("/health", statusHandler)
-  app.get("/info", statusHandler)
-  app.get("/api/status", statusHandler)
-  app.get("/api/info", statusHandler)
-  app.get("/api/health", statusHandler)
 
-  // Stats endpoint
-  app.get("/api/stats", (req, res) => {
+  // Stats endpoint (accessible via /drawly/api/stats)
+  app.get("/stats", (req, res) => {
     const memUsage = process.memoryUsage()
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
     res.json({
@@ -1333,8 +1308,8 @@ function setupRoutes() {
     })
   })
 
-  // Public rooms
-  app.get("/api/rooms", (req, res) => {
+  // Public rooms (accessible via /drawly/api/rooms)
+  app.get("/rooms", (req, res) => {
     const publicRooms = stmt.getPublicRooms.all()
     res.json({
       rooms: publicRooms.map((r) => ({
@@ -1347,8 +1322,8 @@ function setupRoutes() {
     })
   })
 
-  // Auth: Register
-  app.post("/api/auth/register", async (req, res) => {
+  // Auth: Register (accessible via /drawly/api/auth/register)
+  app.post("/auth/register", async (req, res) => {
     try {
       const { email, password, username, displayName } = req.body
 
@@ -1409,8 +1384,8 @@ function setupRoutes() {
     }
   })
 
-  // Auth: Login
-  app.post("/api/auth/login", async (req, res) => {
+  // Auth: Login (accessible via /drawly/api/auth/login)
+  app.post("/auth/login", async (req, res) => {
     try {
       const { email, password } = req.body
 
@@ -1463,8 +1438,8 @@ function setupRoutes() {
     }
   })
 
-  // Auth: Logout
-  app.post("/api/auth/logout", (req, res) => {
+  // Auth: Logout (accessible via /drawly/api/auth/logout)
+  app.post("/auth/logout", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
     if (token) {
       stmt.deleteSession.run(token)
@@ -1472,8 +1447,8 @@ function setupRoutes() {
     res.json({ success: true })
   })
 
-  // Auth: Get current user
-  app.get("/api/auth/me", (req, res) => {
+  // Auth: Get current user (accessible via /drawly/api/auth/me)
+  app.get("/auth/me", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
     if (!token) {
       return res.status(401).json({ error: "Non authentifié" })
@@ -1508,8 +1483,8 @@ function setupRoutes() {
     })
   })
 
-  // Auth: Update profile
-  app.put("/api/auth/profile", (req, res) => {
+  // Auth: Update profile (accessible via /drawly/api/auth/profile)
+  app.put("/auth/profile", (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
     if (!token) {
       return res.status(401).json({ success: false, error: "Non authentifié" })
@@ -1534,8 +1509,8 @@ function setupRoutes() {
     res.json({ success: true })
   })
 
-  // Auth: Change password
-  app.post("/api/auth/change-password", async (req, res) => {
+  // Auth: Change password (accessible via /drawly/api/auth/change-password)
+  app.post("/auth/change-password", async (req, res) => {
     const token = req.headers.authorization?.replace("Bearer ", "")
     if (!token) {
       return res.status(401).json({ success: false, error: "Non authentifié" })
@@ -1579,8 +1554,8 @@ function setupRoutes() {
     })
   })
 
-  // Logs (admin only - simplified check)
-  app.get("/api/logs", (req, res) => {
+  // Logs (admin only - accessible via /drawly/api/logs)
+  app.get("/logs", (req, res) => {
     const limit = Math.min(Number.parseInt(req.query.limit) || 100, 500)
     const type = req.query.type
 
