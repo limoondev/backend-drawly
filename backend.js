@@ -1273,14 +1273,15 @@ function setupRoutes() {
     next()
   })
 
-  app.get("/", (req, res) => {
+  const getStatusResponse = () => {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
-    res.json({
+    return {
       name: CONFIG.server.name,
       version: CONFIG.server.version,
       status: "online",
       players: socketToPlayer.size,
       rooms: rooms.size,
+      connections: socketToPlayer.size,
       uptime,
       stats: {
         connections: socketToPlayer.size,
@@ -1289,71 +1290,25 @@ function setupRoutes() {
         activeRooms: rooms.size,
         uptime,
       },
-    })
-  })
+    }
+  }
 
-  app.get("/status", (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
-    res.json({
-      name: CONFIG.server.name,
-      version: CONFIG.server.version,
-      status: "online",
-      players: socketToPlayer.size,
-      rooms: rooms.size,
-      uptime,
-      stats: {
-        connections: socketToPlayer.size,
-        players: socketToPlayer.size,
-        rooms: rooms.size,
-        activeRooms: rooms.size,
-        uptime,
-      },
-    })
-  })
+  app.get("/", (req, res) => res.json(getStatusResponse()))
+  app.get("/status", (req, res) => res.json(getStatusResponse()))
+  app.get("/health", (req, res) => res.json(getStatusResponse()))
+  app.get("/info", (req, res) =>
+    res.json({ ...getStatusResponse(), features: ["rooms", "auth", "chat", "drawing", "word-selection"] }),
+  )
+  app.get("/api/status", (req, res) => res.json(getStatusResponse()))
+  app.get("/api/info", (req, res) =>
+    res.json({ ...getStatusResponse(), features: ["rooms", "auth", "chat", "drawing", "word-selection"] }),
+  )
+  app.get("/api/health", (req, res) => res.json(getStatusResponse()))
 
   app.get("/socket.io/", (req, res) => {
     res.json({
       status: "Socket.IO endpoint",
       hint: "This endpoint handles Socket.IO connections",
-    })
-  })
-
-  app.get("/api/status", (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
-    res.json({
-      name: CONFIG.server.name,
-      version: CONFIG.server.version,
-      status: "online",
-      players: socketToPlayer.size,
-      rooms: rooms.size,
-      uptime,
-      stats: {
-        connections: socketToPlayer.size,
-        players: socketToPlayer.size,
-        rooms: rooms.size,
-        activeRooms: rooms.size,
-        uptime,
-      },
-    })
-  })
-
-  app.get("/api/info", (req, res) => {
-    const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
-    res.json({
-      name: CONFIG.server.name,
-      version: CONFIG.server.version,
-      status: "online",
-      players: socketToPlayer.size,
-      rooms: rooms.size,
-      uptime,
-      stats: {
-        connections: socketToPlayer.size,
-        players: socketToPlayer.size,
-        rooms: rooms.size,
-        activeRooms: rooms.size,
-        uptime,
-      },
-      features: ["rooms", "auth", "chat", "drawing", "word-selection"],
     })
   })
 
