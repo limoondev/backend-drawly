@@ -1502,6 +1502,103 @@ function setupRoutes() {
     })
   })
 
+  app.post("/rooms/create", (req, res) => {
+    try {
+      const { playerName, settings } = req.body
+
+      if (!playerName || playerName.trim().length === 0) {
+        return res.status(400).json({ success: false, error: "Nom du joueur requis" })
+      }
+
+      const playerId = generateId()
+      const player = {
+        id: playerId,
+        socketId: null, // Will be set when socket connects
+        name: playerName.slice(0, 20),
+        avatar: settings?.avatar || "default",
+        score: 0,
+        isHost: true,
+        isDrawing: false,
+        hasGuessed: false,
+        userId: null,
+      }
+
+      const room = createRoom(player, settings || {})
+
+      // Don't add player to room yet - wait for socket connection
+      // Just reserve the room
+
+      log("room", `Room created via REST: ${room.code}`, { playerId, playerName })
+      logRoomDebugInfo()
+
+      res.json({
+        success: true,
+        roomCode: room.code,
+        roomId: room.id,
+        playerId: playerId,
+      })
+    } catch (err) {
+      log("error", "REST room creation failed", err.message)
+      res.status(500).json({ success: false, error: "Erreur lors de la création" })
+    }
+  })
+
+  app.post("/rooms/join", (req, res) => {
+    try {
+      const { roomCode, playerName } = req.body
+
+      if (!roomCode) {
+        return res.status(400).json({ success: false, error: "Code de partie requis" })
+      }
+
+      if (!playerName || playerName.trim().length === 0) {
+        return res.status(400).json({ success: false, error: "Nom du joueur requis" })
+      }
+
+      const normalizedCode = roomCode.toUpperCase().trim()
+
+      // Force sync from database
+      loadRoomsFromDatabase()
+
+      const room = getRoom(normalizedCode)
+
+      if (!room) {
+        log("warning", `REST join: Room ${normalizedCode} not found`)
+        logRoomDebugInfo()
+        return res.status(404).json({
+          success: false,
+          error: "Partie introuvable",
+          code: normalizedCode,
+        })
+      }
+
+      if (room.players.size >= room.maxPlayers) {
+        return res.status(400).json({ success: false, error: "Partie pleine" })
+      }
+
+      if (room.phase !== "lobby") {
+        return res.status(400).json({ success: false, error: "Partie déjà en cours" })
+      }
+
+      // Generate player ID for the join
+      const playerId = generateId()
+
+      log("room", `REST join prepared: ${normalizedCode}`, { playerId, playerName })
+
+      res.json({
+        success: true,
+        roomCode: room.code,
+        roomId: room.id,
+        playerId: playerId,
+        playerCount: room.players.size,
+        maxPlayers: room.maxPlayers,
+      })
+    } catch (err) {
+      log("error", "REST join failed", err.message)
+      res.status(500).json({ success: false, error: "Erreur lors de la connexion" })
+    }
+  })
+
   app.get("/room/:code", (req, res) => {
     const code = req.params.code?.toUpperCase().trim()
 
@@ -1535,7 +1632,7 @@ function setupRoutes() {
     })
   })
 
-  app.post("/room/verify", (req, res) => {
+  app.post("/rooms/verify", (req, res) => {
     const { code } = req.body
 
     if (!code) {
