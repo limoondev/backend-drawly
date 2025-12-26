@@ -482,6 +482,7 @@ async function verifyPassword(password, hash) {
 // ============================================================
 
 const rooms = new Map()
+const roomCodeIndex = new Map() // code -> roomId for fast lookup
 const socketToPlayer = new Map()
 const roomTimers = new Map()
 const roomChatHistory = new Map()
@@ -780,28 +781,45 @@ function revealHint(word, masked) {
 }
 
 // ============================================================
-// ROOM MANAGEMENT - ENHANCED
+// ROOM MANAGEMENT - ENHANCED v2
 // ============================================================
 
 function loadRoomsFromDatabase() {
-  const dbRooms = stmt.getActiveRooms.all()
-  let loadedCount = 0
+  try {
+    const dbRooms = stmt.getAllRooms.all()
+    let loadedCount = 0
+    let updatedCount = 0
 
-  for (const roomData of dbRooms) {
-    if (!rooms.has(roomData.id)) {
-      const room = reconstructRoomFromDb(roomData)
-      rooms.set(roomData.id, room)
-      roomChatHistory.set(roomData.id, [])
-      roomDrawerOrder.set(roomData.id, [])
-      loadedCount++
+    for (const roomData of dbRooms) {
+      // Always update the code index
+      roomCodeIndex.set(roomData.code, roomData.id)
+
+      if (!rooms.has(roomData.id)) {
+        // Room not in memory, reconstruct it
+        const room = reconstructRoomFromDb(roomData)
+        rooms.set(roomData.id, room)
+        roomChatHistory.set(roomData.id, [])
+        roomDrawerOrder.set(roomData.id, Array.from(room.players.keys()))
+        loadedCount++
+      } else {
+        // Room exists, update player count from DB if needed
+        const room = rooms.get(roomData.id)
+        if (room.players.size !== roomData.player_count) {
+          stmt.updateRoomPlayerCount.run(room.players.size, roomData.id)
+          updatedCount++
+        }
+      }
     }
-  }
 
-  if (loadedCount > 0) {
-    log("db", `Loaded ${loadedCount} rooms from database`)
-  }
+    if (loadedCount > 0 || updatedCount > 0) {
+      log("db", `Rooms sync: ${loadedCount} loaded, ${updatedCount} updated, ${roomCodeIndex.size} indexed`)
+    }
 
-  return loadedCount
+    return loadedCount
+  } catch (err) {
+    log("error", "Failed to load rooms from database", err.message)
+    return 0
+  }
 }
 
 function reconstructRoomFromDb(roomData) {
@@ -846,36 +864,81 @@ function reconstructRoomFromDb(roomData) {
 }
 
 function getRoom(roomCode) {
-  // First check memory
+  if (!roomCode) {
+    log("warning", "getRoom called with empty code")
+    return null
+  }
+
+  const normalizedCode = roomCode.toUpperCase().trim()
+
+  // Method 1: Check code index first (fastest)
+  const roomId = roomCodeIndex.get(normalizedCode)
+  if (roomId && rooms.has(roomId)) {
+    log("debug", `Room ${normalizedCode} found via index`)
+    return rooms.get(roomId)
+  }
+
+  // Method 2: Search memory by code
   for (const [id, room] of rooms) {
-    if (room.code === roomCode) {
+    if (room.code === normalizedCode) {
+      // Update index
+      roomCodeIndex.set(normalizedCode, id)
+      log("debug", `Room ${normalizedCode} found in memory`)
       return room
     }
   }
 
-  // Check database
-  const roomData = stmt.getRoomByCode.get(roomCode)
+  // Method 3: Check database
+  log("debug", `Room ${normalizedCode} not in memory, checking DB...`)
+  const roomData = stmt.getRoomByCode.get(normalizedCode)
+
   if (!roomData) {
+    log("warning", `Room ${normalizedCode} not found in DB either`)
+    logRoomDebugInfo()
     return null
   }
 
   // Reconstruct from DB
+  log("info", `Reconstructing room ${normalizedCode} from database`)
   const room = reconstructRoomFromDb(roomData)
   rooms.set(room.id, room)
+  roomCodeIndex.set(normalizedCode, room.id)
   roomChatHistory.set(room.id, [])
   roomDrawerOrder.set(room.id, Array.from(room.players.keys()))
 
-  log("room", `Room ${roomCode} loaded from database`)
   return room
 }
 
-function roomCodeExists(code) {
-  // Check memory first
-  for (const room of rooms.values()) {
-    if (room.code === code) return true
+function logRoomDebugInfo() {
+  const memoryCodes = Array.from(rooms.values()).map((r) => r.code)
+  const indexCodes = Array.from(roomCodeIndex.keys())
+
+  let dbCodes = []
+  try {
+    dbCodes = stmt.getAllRooms.all().map((r) => r.code)
+  } catch (e) {
+    dbCodes = ["DB_ERROR"]
   }
+
+  log(
+    "debug",
+    `Room debug - Memory: [${memoryCodes.join(", ")}], Index: [${indexCodes.join(", ")}], DB: [${dbCodes.join(", ")}]`,
+  )
+}
+
+function roomCodeExists(code) {
+  const normalizedCode = code.toUpperCase().trim()
+
+  // Check index
+  if (roomCodeIndex.has(normalizedCode)) return true
+
+  // Check memory
+  for (const room of rooms.values()) {
+    if (room.code === normalizedCode) return true
+  }
+
   // Check database
-  return !!stmt.roomExists.get(code)
+  return !!stmt.roomExists.get(normalizedCode)
 }
 
 function createRoom(hostPlayer, settings = {}) {
@@ -914,31 +977,33 @@ function createRoom(hostPlayer, settings = {}) {
     createdAt: Date.now(),
   }
 
-  // Save to database
-  stmt.createRoom.run(
-    id,
-    code,
-    hostPlayer.id,
-    room.isPrivate ? 1 : 0,
-    room.maxPlayers,
-    room.drawTime,
-    room.maxRounds,
-    room.theme,
-  )
+  // Save to database FIRST
+  try {
+    stmt.createRoom.run(
+      id,
+      code,
+      hostPlayer.id,
+      room.isPrivate ? 1 : 0,
+      room.maxPlayers,
+      room.drawTime,
+      room.maxRounds,
+      room.theme,
+    )
+    log("db", `Room ${code} saved to database`)
+  } catch (err) {
+    log("error", `Failed to save room to database: ${err.message}`)
+    throw err
+  }
 
+  // Then add to memory
   rooms.set(id, room)
+  roomCodeIndex.set(code, id) // Update index immediately
   roomChatHistory.set(id, [])
   roomDrawerOrder.set(id, [])
   stats.totalRoomsCreated++
 
   log("room", `Room created: ${code}`, { id, host: hostPlayer.name })
-
-  log(
-    "debug",
-    `Active rooms: ${Array.from(rooms.values())
-      .map((r) => r.code)
-      .join(", ")}`,
-  )
+  logRoomDebugInfo()
 
   return room
 }
@@ -952,19 +1017,27 @@ function joinRoom(room, player) {
   roomDrawerOrder.set(room.id, order)
 
   // Save player to database
-  stmt.createPlayer.run(
-    player.id,
-    room.id,
-    player.userId || null,
-    player.name,
-    player.avatar || null,
-    player.isHost ? 1 : 0,
-    player.socketId,
-  )
+  try {
+    // First delete any existing player with same ID (for reconnection)
+    stmt.deletePlayer.run(player.id)
 
-  stmt.updateRoomPlayerCount.run(room.players.size, room.id)
+    stmt.createPlayer.run(
+      player.id,
+      room.id,
+      player.userId || null,
+      player.name,
+      player.avatar || null,
+      player.isHost ? 1 : 0,
+      player.socketId,
+    )
 
-  log("player", `${player.name} joined room ${room.code} (${room.players.size} players)`)
+    stmt.updateRoomPlayerCount.run(room.players.size, room.id)
+    stmt.updateRoomActivity.run(room.id)
+  } catch (err) {
+    log("error", `Failed to save player to database: ${err.message}`)
+  }
+
+  log("player", `${player.name} joined room ${room.code} (${room.players.size}/${room.maxPlayers} players)`)
 }
 
 function leaveRoom(room, playerId, io) {
@@ -1026,6 +1099,7 @@ function scheduleRoomCleanup(roomId) {
         stmt.deletePlayersByRoom.run(roomId)
         stmt.deleteRoom.run(roomId)
         rooms.delete(roomId)
+        roomCodeIndex.delete(room.code) // Remove from index
         roomChatHistory.delete(roomId)
         roomDrawerOrder.delete(roomId)
         log("room", `Cleaned up empty room: ${room.code}`)
@@ -1380,7 +1454,7 @@ function shuffleArray(array) {
 }
 
 // ============================================================
-// EXPRESSROUTES - ENHANCED
+// EXPRESSROUTES - ENHANCED v2
 // ============================================================
 
 function setupRoutes() {
@@ -1396,7 +1470,6 @@ function setupRoutes() {
     })
   }
 
-  // Status routes (accessible via /drawly/api/status, /drawly/api/health, etc.)
   app.get("/", statusHandler)
   app.get("/status", statusHandler)
   app.get("/health", statusHandler)
@@ -1430,16 +1503,30 @@ function setupRoutes() {
   })
 
   app.get("/room/:code", (req, res) => {
-    const code = req.params.code?.toUpperCase()
+    const code = req.params.code?.toUpperCase().trim()
+
+    if (!code) {
+      return res.status(400).json({ exists: false, error: "Code required" })
+    }
+
+    // Force sync from DB before checking
+    loadRoomsFromDatabase()
+
     const room = getRoom(code)
 
     if (!room) {
-      return res.status(404).json({ exists: false, error: "Room not found" })
+      return res.status(404).json({
+        exists: false,
+        error: "Room not found",
+        searchedCode: code,
+        availableRooms: Array.from(rooms.values()).map((r) => r.code),
+      })
     }
 
     res.json({
       exists: true,
       code: room.code,
+      id: room.id,
       playerCount: room.players.size,
       maxPlayers: room.maxPlayers,
       phase: room.phase,
@@ -1448,41 +1535,74 @@ function setupRoutes() {
     })
   })
 
+  app.post("/room/verify", (req, res) => {
+    const { code } = req.body
+
+    if (!code) {
+      return res.status(400).json({ valid: false, error: "Code required" })
+    }
+
+    const normalizedCode = code.toUpperCase().trim()
+
+    // Force reload from DB
+    loadRoomsFromDatabase()
+
+    const room = getRoom(normalizedCode)
+
+    if (!room) {
+      return res.json({
+        valid: false,
+        error: "Partie introuvable",
+        debug: {
+          searchedCode: normalizedCode,
+          roomsInMemory: rooms.size,
+          roomCodes: Array.from(rooms.values()).map((r) => r.code),
+        },
+      })
+    }
+
+    if (room.players.size >= room.maxPlayers) {
+      return res.json({ valid: false, error: "Partie pleine" })
+    }
+
+    if (room.phase !== "lobby") {
+      return res.json({ valid: false, error: "Partie en cours" })
+    }
+
+    res.json({
+      valid: true,
+      code: room.code,
+      playerCount: room.players.size,
+      maxPlayers: room.maxPlayers,
+    })
+  })
+
   app.get("/rooms/codes", (req, res) => {
-    const codes = Array.from(rooms.values()).map((r) => ({
+    // Force sync first
+    loadRoomsFromDatabase()
+
+    const memoryCodes = Array.from(rooms.values()).map((r) => ({
       code: r.code,
+      id: r.id,
       players: r.players.size,
       phase: r.phase,
     }))
 
-    // Also get from DB
     const dbRooms = stmt.getAllRooms.all()
     const dbCodes = dbRooms.map((r) => ({
       code: r.code,
+      id: r.id,
       players: r.player_count,
       phase: r.phase,
       inMemory: rooms.has(r.id),
     }))
 
     res.json({
-      memory: codes,
+      memory: memoryCodes,
       database: dbCodes,
-      totalMemory: codes.length,
+      index: Array.from(roomCodeIndex.entries()).map(([code, id]) => ({ code, id })),
+      totalMemory: memoryCodes.length,
       totalDatabase: dbCodes.length,
-    })
-  })
-
-  // Public rooms (accessible via /drawly/api/rooms)
-  app.get("/rooms", (req, res) => {
-    const publicRooms = stmt.getPublicRooms.all()
-    res.json({
-      rooms: publicRooms.map((r) => ({
-        code: r.code,
-        playerCount: r.player_count,
-        maxPlayers: r.max_players,
-        phase: r.phase,
-        theme: r.theme,
-      })),
     })
   })
 
@@ -1501,7 +1621,7 @@ function setupRoutes() {
 }
 
 // ============================================================
-// SOCKET HANDLERS - ENHANCED
+// SOCKET HANDLERS - ENHANCED v2
 // ============================================================
 
 function setupSocketHandlers() {
@@ -1527,7 +1647,6 @@ function setupSocketHandlers() {
       return
     }
 
-    // Create room
     socket.on("room:create", (data, callback) => {
       try {
         log("room", `Creating room for: ${data.playerName}`)
@@ -1551,7 +1670,10 @@ function setupSocketHandlers() {
         socketToPlayer.set(socket.id, player)
         socket.join(room.id)
 
-        log("success", `Room created: ${room.code}`, { player: player.name })
+        log("success", `Room created: ${room.code}`, { player: player.name, roomId: room.id })
+
+        // Log current state
+        logRoomDebugInfo()
 
         callback({
           success: true,
@@ -1569,20 +1691,30 @@ function setupSocketHandlers() {
 
     socket.on("room:join", (data, callback) => {
       try {
-        const roomCode = data.roomCode?.toUpperCase()
+        const roomCode = data.roomCode?.toUpperCase().trim()
         log("room", `Join request: ${roomCode} by ${data.playerName}`)
+
+        if (!roomCode) {
+          return callback({ success: false, error: "Code de partie requis" })
+        }
+
+        // Force sync from database before looking up
+        loadRoomsFromDatabase()
 
         const room = getRoom(roomCode)
 
         if (!room) {
           log("warning", `Room not found: ${roomCode}`)
-          log(
-            "debug",
-            `Available rooms: ${Array.from(rooms.values())
-              .map((r) => r.code)
-              .join(", ")}`,
-          )
-          return callback({ success: false, error: "Partie introuvable" })
+          logRoomDebugInfo()
+          return callback({
+            success: false,
+            error: "Partie introuvable",
+            debug: `Code: ${roomCode}, Rooms disponibles: ${
+              Array.from(rooms.values())
+                .map((r) => r.code)
+                .join(", ") || "aucune"
+            }`,
+          })
         }
 
         if (room.players.size >= room.maxPlayers) {
@@ -1590,27 +1722,40 @@ function setupSocketHandlers() {
         }
 
         if (room.phase !== "lobby") {
-          return callback({ success: false, error: "Partie en cours" })
+          return callback({ success: false, error: "Partie déjà en cours" })
         }
 
-        const playerId = data.playerId || generateId()
-        const player = {
-          id: playerId,
-          socketId: socket.id,
-          name: data.playerName?.slice(0, 20) || "Joueur",
-          avatar: data.avatar || "default",
-          score: 0,
-          isHost: false,
-          isDrawing: false,
-          hasGuessed: false,
-          userId: null,
+        // Check if player is reconnecting
+        const existingPlayer = data.playerId ? room.players.get(data.playerId) : null
+
+        let player
+        if (existingPlayer) {
+          // Reconnection
+          log("player", `Reconnecting player ${existingPlayer.name} to room ${room.code}`)
+          existingPlayer.socketId = socket.id
+          stmt.updatePlayerSocket.run(socket.id, existingPlayer.id)
+          player = existingPlayer
+        } else {
+          // New player
+          const playerId = generateId()
+          player = {
+            id: playerId,
+            socketId: socket.id,
+            name: data.playerName?.slice(0, 20) || "Joueur",
+            avatar: data.avatar || "default",
+            score: 0,
+            isHost: false,
+            isDrawing: false,
+            hasGuessed: false,
+            userId: null,
+          }
+          joinRoom(room, player)
         }
 
-        joinRoom(room, player)
         socketToPlayer.set(socket.id, player)
         socket.join(room.id)
 
-        log("success", `${player.name} joined ${room.code}`)
+        log("success", `${player.name} joined ${room.code} (${room.players.size}/${room.maxPlayers})`)
 
         const messages = roomChatHistory.get(room.id) || []
 
@@ -1619,6 +1764,11 @@ function setupSocketHandlers() {
           roomCode: room.code,
           roomId: room.id,
           playerId: player.id,
+          room: {
+            phase: room.phase,
+            drawTime: room.drawTime,
+            maxRounds: room.maxRounds,
+          },
           messages: messages.slice(-50),
         })
 
@@ -1857,7 +2007,7 @@ function setupSocketHandlers() {
 }
 
 // ============================================================
-// CLEANUP - ENHANCED
+// CLEANUP - ENHANCED v2
 // ============================================================
 
 function setupCleanup() {
@@ -1881,6 +2031,7 @@ function setupCleanup() {
           stmt.deletePlayersByRoom.run(id) // Use 'id' here
           stmt.deleteRoom.run(id) // Use 'id' here
           rooms.delete(id)
+          roomCodeIndex.delete(room.code) // Remove from index
           roomChatHistory.delete(id)
           roomDrawerOrder.delete(id)
           log("info", `Cleaned up empty room: ${room.code}`)
@@ -1913,7 +2064,13 @@ function setupCleanup() {
 
   setInterval(() => {
     loadRoomsFromDatabase()
-  }, 30000)
+  }, 10000)
+
+  setInterval(() => {
+    if (rooms.size > 0 || socketToPlayer.size > 0) {
+      log("debug", `State: ${rooms.size} rooms, ${socketToPlayer.size} sockets, ${roomCodeIndex.size} indexed codes`)
+    }
+  }, 60000)
 }
 
 // ============================================================
