@@ -2248,8 +2248,9 @@ function startServer() {
   io = new Server(server, {
     cors: {
       origin: "*",
-      methods: ["GET", "POST"],
+      methods: ["GET", "POST", "OPTIONS"],
       credentials: true,
+      allowedHeaders: ["Content-Type", "Authorization"],
     },
     path: SOCKET_PATH,
     transports: ["polling", "websocket"],
