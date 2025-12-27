@@ -2,7 +2,7 @@
 // ============================================================
 // DRAWLY BACKEND v5.5.0 - Enhanced Room Sync & Persistence
 // ============================================================
-// Optimized for: https://limoon-space.cloud/drawly/
+// Optimized for: https://limoon-space.cloud/srv/drawly/
 // ============================================================
 
 import express from "express"
@@ -110,8 +110,8 @@ const CONFIG = {
   port: Number.parseInt(process.env.PORT) || 3001,
   host: process.env.HOST || "0.0.0.0", // Listen on all interfaces for Coolify
 
-  publicUrl: process.env.PUBLIC_URL || "https://limoon-space.cloud/drawly",
-  basePath: process.env.BASE_PATH || "/drawly",
+  publicUrl: process.env.PUBLIC_URL || "https://limoon-space.cloud/srv/drawly",
+  basePath: process.env.BASE_PATH || "/srv/drawly",
 
   ssl: {
     enabled: env.behindProxy ? false : process.env.SSL !== "false",
@@ -1458,6 +1458,8 @@ function shuffleArray(array) {
 // ============================================================
 
 function setupRoutes() {
+  const apiRouter = express.Router()
+
   const statusHandler = (req, res) => {
     res.json({
       status: "online",
@@ -1474,7 +1476,12 @@ function setupRoutes() {
   app.get("/status", statusHandler)
   app.get("/health", statusHandler)
 
-  app.get("/stats", (req, res) => {
+  // API routes with /api prefix
+  apiRouter.get("/", statusHandler)
+  apiRouter.get("/status", statusHandler)
+  apiRouter.get("/health", statusHandler)
+
+  const statsHandler = (req, res) => {
     const memUsage = process.memoryUsage()
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000)
 
@@ -1500,9 +1507,12 @@ function setupRoutes() {
         total: Math.round(memUsage.heapTotal / 1024 / 1024),
       },
     })
-  })
+  }
 
-  app.post("/rooms/create", (req, res) => {
+  app.get("/stats", statsHandler)
+  apiRouter.get("/stats", statsHandler)
+
+  const createRoomHandler = (req, res) => {
     try {
       const { playerName, settings } = req.body
 
@@ -1513,7 +1523,7 @@ function setupRoutes() {
       const playerId = generateId()
       const player = {
         id: playerId,
-        socketId: null, // Will be set when socket connects
+        socketId: null,
         name: playerName.slice(0, 20),
         avatar: settings?.avatar || "default",
         score: 0,
@@ -1524,9 +1534,6 @@ function setupRoutes() {
       }
 
       const room = createRoom(player, settings || {})
-
-      // Don't add player to room yet - wait for socket connection
-      // Just reserve the room
 
       log("room", `Room created via REST: ${room.code}`, { playerId, playerName })
       logRoomDebugInfo()
@@ -1541,9 +1548,12 @@ function setupRoutes() {
       log("error", "REST room creation failed", err.message)
       res.status(500).json({ success: false, error: "Erreur lors de la création" })
     }
-  })
+  }
 
-  app.post("/rooms/join", (req, res) => {
+  app.post("/rooms/create", createRoomHandler)
+  apiRouter.post("/rooms/create", createRoomHandler)
+
+  const joinRoomHandler = (req, res) => {
     try {
       const { roomCode, playerName } = req.body
 
@@ -1557,7 +1567,6 @@ function setupRoutes() {
 
       const normalizedCode = roomCode.toUpperCase().trim()
 
-      // Force sync from database
       loadRoomsFromDatabase()
 
       const room = getRoom(normalizedCode)
@@ -1580,7 +1589,6 @@ function setupRoutes() {
         return res.status(400).json({ success: false, error: "Partie déjà en cours" })
       }
 
-      // Generate player ID for the join
       const playerId = generateId()
 
       log("room", `REST join prepared: ${normalizedCode}`, { playerId, playerName })
@@ -1597,16 +1605,18 @@ function setupRoutes() {
       log("error", "REST join failed", err.message)
       res.status(500).json({ success: false, error: "Erreur lors de la connexion" })
     }
-  })
+  }
 
-  app.get("/room/:code", (req, res) => {
+  app.post("/rooms/join", joinRoomHandler)
+  apiRouter.post("/rooms/join", joinRoomHandler)
+
+  const roomInfoHandler = (req, res) => {
     const code = req.params.code?.toUpperCase().trim()
 
     if (!code) {
       return res.status(400).json({ exists: false, error: "Code required" })
     }
 
-    // Force sync from DB before checking
     loadRoomsFromDatabase()
 
     const room = getRoom(code)
@@ -1630,9 +1640,12 @@ function setupRoutes() {
       isPrivate: room.isPrivate,
       canJoin: room.players.size < room.maxPlayers && room.phase === "lobby",
     })
-  })
+  }
 
-  app.post("/rooms/verify", (req, res) => {
+  app.get("/room/:code", roomInfoHandler)
+  apiRouter.get("/room/:code", roomInfoHandler)
+
+  const verifyRoomHandler = (req, res) => {
     const { code } = req.body
 
     if (!code) {
@@ -1641,7 +1654,6 @@ function setupRoutes() {
 
     const normalizedCode = code.toUpperCase().trim()
 
-    // Force reload from DB
     loadRoomsFromDatabase()
 
     const room = getRoom(normalizedCode)
@@ -1672,10 +1684,12 @@ function setupRoutes() {
       playerCount: room.players.size,
       maxPlayers: room.maxPlayers,
     })
-  })
+  }
 
-  app.get("/rooms/codes", (req, res) => {
-    // Force sync first
+  app.post("/rooms/verify", verifyRoomHandler)
+  apiRouter.post("/rooms/verify", verifyRoomHandler)
+
+  const roomCodesHandler = (req, res) => {
     loadRoomsFromDatabase()
 
     const memoryCodes = Array.from(rooms.values()).map((r) => ({
@@ -1701,10 +1715,12 @@ function setupRoutes() {
       totalMemory: memoryCodes.length,
       totalDatabase: dbCodes.length,
     })
-  })
+  }
 
-  // Logs (admin only - accessible via /drawly/logs)
-  app.get("/logs", (req, res) => {
+  app.get("/rooms/codes", roomCodesHandler)
+  apiRouter.get("/rooms/codes", roomCodesHandler)
+
+  const logsHandler = (req, res) => {
     const limit = Math.min(Number.parseInt(req.query.limit) || 100, 500)
     const type = req.query.type
 
@@ -1714,7 +1730,25 @@ function setupRoutes() {
     }
 
     res.json({ logs: logs.slice(0, limit) })
-  })
+  }
+
+  app.get("/logs", logsHandler)
+  apiRouter.get("/logs", logsHandler)
+
+  const maintenanceHandler = (req, res) => {
+    res.json({
+      enabled: false,
+      reason: null,
+      severity: "info",
+    })
+  }
+
+  app.get("/maintenance", maintenanceHandler)
+  apiRouter.get("/maintenance", maintenanceHandler)
+
+  app.use("/api", apiRouter)
+
+  log("info", "Routes setup complete - available at both / and /api/")
 }
 
 // ============================================================
